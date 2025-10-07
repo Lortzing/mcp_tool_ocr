@@ -30,6 +30,22 @@ class _DummyPILImage:
 _make_module("PIL", {"Image": _DummyPILImage})
 
 # stub other modules imported at top of document_parser_refactored.py
+_make_module(
+    "fitz",
+    {
+        "Matrix": lambda x, y: None,
+        "Pixmap": type(
+            "_Pixmap",
+            (),
+            {
+                "__init__": lambda self, *a, **k: None,
+                "tobytes": lambda self, fmt: b"",
+            },
+        ),
+        "csRGB": object(),
+        "open": lambda *a, **k: None,
+    },
+)
 _make_module("pdfplumber")
 _make_module("camelot", {"read_pdf": lambda *a, **k: []})
 _make_module("docx", {"Document": lambda f: None})
