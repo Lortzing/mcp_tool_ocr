@@ -31,12 +31,35 @@ def _b64(bytestr: bytes) -> str:
 
 class VLMClient:
     """VLM client (sync). assumes httpx is available and endpoint configured if used."""
-    def __init__(self, endpoint: str = "", token: Optional[str] = None, timeout: float = 120.0):
+
+    def __init__(
+        self,
+        endpoint: str = "",
+        token: Optional[str] = None,
+        timeout: float = 120.0,
+        provider: str | None = None,
+        model: Optional[str] = None,
+    ):
         self.endpoint = endpoint
         self.token = token
         self.timeout = timeout
+        self.provider = (provider or "generic").lower()
+        self.model = model
 
-    def call_sync(self, images_b64: List[str], ocr_text: str, task: str = "document_understanding") -> Dict[str, Any]:
+    def call_sync(
+        self,
+        images_b64: List[str],
+        ocr_text: str,
+        task: str = "document_understanding",
+    ) -> Dict[str, Any]:
+        """Dispatch to the correct backend based on provider."""
+
+        if not self.endpoint:
+            return {"error": "VLM endpoint not configured"}
+
+        if "dashscope.aliyuncs.com" in self.endpoint or self.provider == "dashscope":
+            return self._call_dashscope(images_b64, ocr_text, task)
+
         headers = {"Content-Type": "application/json"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -48,6 +71,51 @@ class VLMClient:
                 return {"vlm_result": resp.json()}
         except Exception as e:
             return {"error": f"VLM call failed: {str(e)}"}
+
+    def _call_dashscope(self, images_b64: List[str], ocr_text: str, task: str) -> Dict[str, Any]:
+        """Call Qwen2.5-VL through DashScope's OpenAI-compatible endpoint."""
+
+        if not self.token:
+            return {"error": "DashScope VLM requires an access token"}
+
+        model = self.model or "qwen2.5-vl"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"}
+        messages_content: List[Dict[str, Any]] = []
+        if ocr_text:
+            messages_content.append(
+                {
+                    "type": "input_text",
+                    "text": f"Task: {task}\nOCR Context:\n{ocr_text}",
+                }
+            )
+        else:
+            messages_content.append({"type": "input_text", "text": f"Task: {task}"})
+
+        for img in images_b64:
+            messages_content.append({"type": "input_image", "image": img})
+
+        payload = {
+            "model": model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": messages_content,
+                }
+            ],
+        }
+
+        endpoint = self.endpoint.rstrip("/")
+        # DashScope uses /responses for the OpenAI compatible format.
+        if not endpoint.endswith("/responses"):
+            endpoint = f"{endpoint}/responses"
+
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                return {"vlm_result": resp.json()}
+        except Exception as e:
+            return {"error": f"DashScope VLM call failed: {str(e)}"}
 
 
 class OCRHelper:
@@ -388,8 +456,22 @@ class PptxParser(BaseParser):
 # -------------------------
 
 class DocumentProcessor:
-    def __init__(self, use_ocr: bool = True, vlm_endpoint: Optional[str] = None, vlm_token: Optional[str] = None, ocr_lang: str = "eng", camelot_enable: bool = True, pdfplumber_enable: bool = True):
-        self.vlm_client = VLMClient(endpoint=vlm_endpoint, token=vlm_token) if vlm_endpoint else None
+    def __init__(
+        self,
+        use_ocr: bool = True,
+        vlm_endpoint: Optional[str] = None,
+        vlm_token: Optional[str] = None,
+        ocr_lang: str = "eng",
+        camelot_enable: bool = True,
+        pdfplumber_enable: bool = True,
+        vlm_provider: Optional[str] = None,
+        vlm_model: Optional[str] = None,
+    ):
+        self.vlm_client = (
+            VLMClient(endpoint=vlm_endpoint, token=vlm_token, provider=vlm_provider, model=vlm_model)
+            if vlm_endpoint
+            else None
+        )
         self.use_ocr = use_ocr
         self.ocr_lang = ocr_lang
         self.camelot_enable = camelot_enable
@@ -424,20 +506,13 @@ if mcp:
     @mcp.tool
     def parse_document_url(
         file_url: str,
-        run_vlm: bool = False,
-        vlm_api_url: Optional[str] = None,
-        vlm_token: Optional[str] = None,
-        use_ocr: bool = True,
-        ocr_lang: str = "eng",
-        camelot_enable: bool = True,
-        pdfplumber_enable: bool = True
+        options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Main MCP entrypoint.
-        - file_url: http(s) URL pointing to the file
-        - run_vlm + vlm_api_url: if True and provided, VLM will be used
-        """
+        """Main MCP entrypoint."""
+
+        opts = options or {}
         try:
-            with httpx.Client(timeout=60.0) as client:
+            with httpx.Client(timeout=opts.get("timeout", 60.0)) as client:
                 resp = client.get(file_url)
                 resp.raise_for_status()
                 file_bytes = resp.content
@@ -446,8 +521,25 @@ if mcp:
 
         filename = os.path.basename(urllib.parse.urlparse(file_url).path) or "downloaded_file"
 
-        vlm_endpoint = vlm_api_url if run_vlm and vlm_api_url else None
-        dp = DocumentProcessor(use_ocr=use_ocr, vlm_endpoint=vlm_endpoint, vlm_token=vlm_token, ocr_lang=ocr_lang, camelot_enable=camelot_enable, pdfplumber_enable=pdfplumber_enable)
+        run_vlm = opts.get("run_vlm", False)
+        vlm_api_url = opts.get("vlm_api_url")
+        vlm_token = opts.get("vlm_token")
+        vlm_model = opts.get("vlm_model")
+        vlm_provider = opts.get("vlm_provider")
+
+        if not vlm_provider and isinstance(vlm_api_url, str) and "dashscope.aliyuncs.com" in vlm_api_url:
+            vlm_provider = "dashscope"
+
+        dp = DocumentProcessor(
+            use_ocr=opts.get("use_ocr", True),
+            vlm_endpoint=vlm_api_url if run_vlm and vlm_api_url else None,
+            vlm_token=vlm_token,
+            ocr_lang=opts.get("ocr_lang", "eng"),
+            camelot_enable=opts.get("camelot_enable", True),
+            pdfplumber_enable=opts.get("pdfplumber_enable", True),
+            vlm_provider=vlm_provider,
+            vlm_model=vlm_model,
+        )
 
         try:
             return dp.parse(file_bytes, filename)
