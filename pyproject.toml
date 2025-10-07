@@ -1,0 +1,19 @@
+[project]
+name = "mcp-tool-ocr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "camelot>=12.6.29",
+    "fastapi>=0.118.0",
+    "fastmcp>=2.12.4",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "pdfplumber>=0.11.7",
+    "pytesseract>=0.3.13",
+    "pytest>=8.4.2",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "starlette>=0.48.0",
+]
