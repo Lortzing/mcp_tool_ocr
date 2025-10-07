@@ -22,6 +22,13 @@ import openpyxl
 from pptx import Presentation
 import httpx
 
+from config import (
+    DASHSCOPE_API_KEY,
+    DASHSCOPE_ENDPOINT,
+    DASHSCOPE_MODEL,
+    DASHSCOPE_PROVIDER,
+)
+
 from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -468,12 +475,22 @@ class DocumentProcessor:
         pdfplumber_enable: bool = True,
         vlm_provider: Optional[str] = None,
         vlm_model: Optional[str] = None,
+        enable_vlm: bool = False,
     ):
-        self.vlm_client = (
-            VLMClient(endpoint=vlm_endpoint, token=vlm_token, provider=vlm_provider, model=vlm_model)
-            if vlm_endpoint
-            else None
-        )
+        if enable_vlm:
+            resolved_endpoint = vlm_endpoint or DASHSCOPE_ENDPOINT
+            resolved_token = vlm_token or DASHSCOPE_API_KEY
+            resolved_provider = (vlm_provider or DASHSCOPE_PROVIDER) if DASHSCOPE_PROVIDER else vlm_provider
+            resolved_model = vlm_model or DASHSCOPE_MODEL
+
+            self.vlm_client = VLMClient(
+                endpoint=resolved_endpoint,
+                token=resolved_token,
+                provider=resolved_provider,
+                model=resolved_model,
+            )
+        else:
+            self.vlm_client = None
         self.use_ocr = use_ocr
         self.ocr_lang = ocr_lang
         self.camelot_enable = camelot_enable
@@ -541,6 +558,7 @@ if mcp:
             pdfplumber_enable=opts.get("pdfplumber_enable", True),
             vlm_provider=vlm_provider,
             vlm_model=vlm_model,
+            enable_vlm=run_vlm,
         )
 
         try:
