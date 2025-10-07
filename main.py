@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import os
 import time
+import json
 import base64
 import traceback
 import urllib.parse
@@ -170,7 +171,9 @@ class OCRHelper:
 # -------------------------
 
 class BaseParser:
-    def __init__(self, use_ocr: bool = True, vlm_client: Optional[VLMClient] = None, ocr_lang: str | List[str] = "eng"):
+    def __init__(self, use_ocr: bool = False, vlm_client: Optional[VLMClient] = None, ocr_lang: str | List[str] = "eng"):
+        # OCR is disabled by default. We keep the flag for backwards compatibility
+        # but avoid invoking OCR logic in new flows unless explicitly requested.
         self.use_ocr = use_ocr
         self.vlm_client = vlm_client
         self.ocr_lang = ocr_lang
@@ -296,26 +299,18 @@ class PDFParser(BaseParser):
         except Exception:
             need_ocr_pages = list(range(len(doc)))
 
-        images_for_vlm: List[bytes] = []
-        ocr_agg: List[str] = []
-
-        if self.use_ocr:
-            for pnum in need_ocr_pages:
-                try:
-                    page = doc[pnum]
-                    img_bytes = self._render_page_to_png(page, zoom=2.0)
-                    images_for_vlm.append(img_bytes)
-                    ocr_out = OCRHelper.image_to_data(img_bytes, lang=self.ocr_lang)
-                    if pnum < len(result["pages"]):
-                        result["pages"][pnum]["ocr"] = ocr_out
-                    else:
-                        result["pages"].append({"page_number": pnum + 1, "text": "", "ocr": ocr_out})
-                    ocr_agg.extend([b.get("text", "") for b in ocr_out.get("blocks", [])])
-                except Exception as e:
-                    result["warnings"].append(f"OCR failed on page {pnum+1}: {str(e)}")
-        else:
-            # 如果不想执行 OCR，请在构造时设置 use_ocr=False
-            pass
+        vlm_page_results: List[Dict[str, Any]] = []
+        for pnum in need_ocr_pages:
+            try:
+                page = doc[pnum]
+                img_bytes = self._render_page_to_png(page, zoom=2.0)
+                if self.vlm_client and self.vlm_client.endpoint:
+                    vlm_response = self.vlm_client.call_sync([_b64(img_bytes)], "")
+                else:
+                    vlm_response = {"error": "vlm endpoint not configured"}
+                vlm_page_results.append({"page_number": pnum + 1, "vlm": vlm_response})
+            except Exception as e:
+                result["warnings"].append(f"VLM analysis failed on page {pnum+1}: {str(e)}")
 
         # embedded images
         try:
@@ -323,15 +318,8 @@ class PDFParser(BaseParser):
         except Exception as e:
             result["warnings"].append(f"extract embedded images failed: {str(e)}")
 
-        # optional VLM
-        if self.vlm_client and self.vlm_client.endpoint:
-            try:
-                img_b64s = [_b64(b) for b in images_for_vlm[:3]]
-                ocr_text = "\n".join(ocr_agg)
-                vlm_res = self.vlm_client.call_sync(img_b64s, ocr_text)
-                result["vlm"] = vlm_res
-            except Exception as e:
-                result["warnings"].append(f"VLM call failed: {str(e)}")
+        if vlm_page_results:
+            result["vlm_pages"] = vlm_page_results
 
         result["elapsed_seconds"] = time.time() - start
         return result
@@ -340,19 +328,16 @@ class PDFParser(BaseParser):
 class ImageParser(BaseParser):
     def parse(self, data: bytes) -> Dict[str, Any]:
         start = time.time()
-        result: Dict[str, Any] = {"code": 0, "type": "image", "ocr": None, "vlm": None, "elapsed_seconds": None}
-        ocr_out = None
-        if self.use_ocr:
-            ocr_out = OCRHelper.image_to_data(data, lang=self.ocr_lang)
-            result["ocr"] = ocr_out
+        result: Dict[str, Any] = {"code": 0, "type": "image", "vlm": None, "elapsed_seconds": None}
         if self.vlm_client and self.vlm_client.endpoint:
             try:
                 img_b64 = _b64(data)
-                ocr_text = "\n".join([b.get("text", "") for b in (ocr_out.get("blocks") if ocr_out else [])])
-                vlm_res = self.vlm_client.call_sync([img_b64], ocr_text)
+                vlm_res = self.vlm_client.call_sync([img_b64], "")
                 result["vlm"] = vlm_res
             except Exception as e:
                 result["vlm"] = {"error": str(e)}
+        else:
+            result["vlm"] = {"error": "vlm endpoint not configured"}
         result["elapsed_seconds"] = time.time() - start
         return result
 
@@ -370,7 +355,27 @@ class DocxParser(BaseParser):
                     cells = [c.text for c in r.cells]
                     rows.append(cells)
                 tables.append(rows)
-            return {"code": 0, "type": "docx", "content": {"paragraphs": paras, "tables": tables}, "elapsed_seconds": time.time() - start}
+            images_vlm: List[Dict[str, Any]] = []
+            try:
+                rels = doc.part.rels.values()
+                for rel in rels:
+                    if "image" in rel.reltype:
+                        blob = rel.target_part.blob
+                        if self.vlm_client and self.vlm_client.endpoint:
+                            vlm_res = self.vlm_client.call_sync([_b64(blob)], "")
+                        else:
+                            vlm_res = {"error": "vlm endpoint not configured"}
+                        images_vlm.append({"vlm": vlm_res})
+            except Exception as e:
+                images_vlm.append({"error": f"failed to analyse images: {str(e)}"})
+
+            return {
+                "code": 0,
+                "type": "docx",
+                "content": {"paragraphs": paras, "tables": tables},
+                "images_vlm": images_vlm,
+                "elapsed_seconds": time.time() - start,
+            }
         except Exception as e:
             return {"error": str(e)}
 
@@ -427,28 +432,25 @@ class PptxParser(BaseParser):
                 pass
             slides_out.append({"slide_number": i + 1, "texts": slide_text_chunks, "notes": notes_text})
 
-        # optional OCR on images embedded in slides
-        ocr_results = []
-        if self.use_ocr:
-            for idx, img_item in enumerate(images_out[:10]):  # cap
+        images_vlm_results: List[Dict[str, Any]] = []
+        for img in images_out:
+            if self.vlm_client and self.vlm_client.endpoint:
                 try:
-                    b = base64.b64decode(img_item["bytes_b64"])
-                    ocr_out = OCRHelper.image_to_data(b, lang=self.ocr_lang)
-                    ocr_results.append({"slide": img_item.get("slide"), "ocr": ocr_out})
-                except Exception:
-                    continue
+                    vlm_res = self.vlm_client.call_sync([img["bytes_b64"]], "")
+                except Exception as e:
+                    vlm_res = {"error": str(e)}
+            else:
+                vlm_res = {"error": "vlm endpoint not configured"}
+            images_vlm_results.append({"slide": img.get("slide"), "vlm": vlm_res})
 
-        # optional VLM
-        vlm_res = None
-        if self.vlm_client and self.vlm_client.endpoint:
-            try:
-                img_b64s = [i["bytes_b64"] for i in images_out[:5]]
-                ocr_text = "\n".join([" ".join(s.get("texts", [])) for s in slides_out])
-                vlm_res = self.vlm_client.call_sync(img_b64s, ocr_text)
-            except Exception:
-                vlm_res = {"error": "vlm call failed"}
-
-        return {"code": 0, "type": "pptx", "slides": slides_out, "images": images_out, "ocr_on_images": ocr_results, "vlm": vlm_res, "elapsed_seconds": time.time() - start}
+        return {
+            "code": 0,
+            "type": "pptx",
+            "slides": slides_out,
+            "images": images_out,
+            "images_vlm": images_vlm_results,
+            "elapsed_seconds": time.time() - start,
+        }
 
 
 # -------------------------
@@ -458,7 +460,7 @@ class PptxParser(BaseParser):
 class DocumentProcessor:
     def __init__(
         self,
-        use_ocr: bool = True,
+        use_ocr: bool = False,
         vlm_endpoint: Optional[str] = None,
         vlm_token: Optional[str] = None,
         ocr_lang: str = "eng",
@@ -507,7 +509,7 @@ if mcp:
     def parse_document_url(
         file_url: str,
         options: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """Main MCP entrypoint."""
 
         opts = options or {}
@@ -531,7 +533,7 @@ if mcp:
             vlm_provider = "dashscope"
 
         dp = DocumentProcessor(
-            use_ocr=opts.get("use_ocr", True),
+            use_ocr=opts.get("use_ocr", False),
             vlm_endpoint=vlm_api_url if run_vlm and vlm_api_url else None,
             vlm_token=vlm_token,
             ocr_lang=opts.get("ocr_lang", "eng"),
@@ -542,7 +544,8 @@ if mcp:
         )
 
         try:
-            return dp.parse(file_bytes, filename)
+            parsed = dp.parse(file_bytes, filename)
+            return json.dumps(parsed, ensure_ascii=False, indent=2)
         except ValueError as e:
             return {"error": str(e)}
         except Exception:
