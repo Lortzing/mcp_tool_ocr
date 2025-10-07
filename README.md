@@ -7,14 +7,24 @@ It can download remote files, run OCR/table extraction, optionally invoke a Visi
 
 - **Multi-format parsing** via PyMuPDF, pdfplumber, Camelot, python-docx, pandas/openpyxl, and python-pptx.
 - **OCR fallback** using Tesseract with configurable languages.
-- **DashScope Qwen2.5-VL integration** through a dedicated VLM client helper.
+- **Qwen3-VL-Plus integration** through the official `openai` Python SDK (OpenAI-compatible endpoint).
+- **Configurable PDF parsing modes** that let you choose between OCR-centric extraction or VLM-driven Markdown conversion.
 - **MCP tool** `parse_document_url` that accepts a single `options` dictionary while retaining the original flexibility.
 - **Health endpoint** for simple runtime checks when hosted through FastMCP.
 
-## Using the DashScope Qwen2.5-VL backend
+## Configuring Qwen3-VL-Plus via the OpenAI SDK
 
-1. Obtain a DashScope API key (the repository defaults to `qwen2.5-vl`).
-2. When constructing the MCP request, pass the VLM settings inside `options`:
+The VLM client uses the official `openai` package to talk to Aliyun's OpenAI-compatible endpoint.
+
+1. Export the required environment variables (defaults shown below). The API key can be provided through either `OPENAI_API_KEY` or the legacy `DASHSCOPE_API_KEY` variable.
+
+   ```bash
+   export OPENAI_API_KEY="sk-..."
+   export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+   export QWEN_VLM_MODEL="qwen3-vl-plus"
+   ```
+
+2. Call the MCP tool with the desired parsing mode:
 
    ```json
    {
@@ -22,19 +32,19 @@ It can download remote files, run OCR/table extraction, optionally invoke a Visi
      "arguments": {
        "file_url": "https://example.com/sample.pdf",
        "options": {
+         "pdf_parse_mode": "vlm",   // or "ocr"
          "use_ocr": true,
-         "run_vlm": true,
-         "vlm_api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-         "vlm_token": "sk-...",
-         "vlm_model": "qwen2.5-vl"
+         "ocr_lang": "eng+chi_sim"
        }
      }
    }
    ```
 
-3. The tool automatically normalises DashScope URLs and prepares the OpenAI-compatible payload (text instructions + base64 images) before calling the API.
+   - `pdf_parse_mode="vlm"` converts every PDF page to an image, sends the batch to Qwen3-VL-Plus with a Markdown-oriented prompt, and returns the model's Markdown response alongside the rendered page images.
+   - `pdf_parse_mode="ocr"` keeps the hybrid extractor, optionally running OCR on empty pages and using the VLM to transcribe individual pages when needed.
+   - Image parsing always leverages the VLM with prompts tuned to describe scenes, tables, and formulas (rendered as LaTeX).
 
-> **Note:** Network egress is blocked in this execution environment.  A manual attempt to call the Qwen endpoint therefore fails with `Tunnel connection failed: 403` (see the testing section).  The code path is exercised through automated tests with HTTP stubs.
+> **Note:** Outbound network access remains disabled in the evaluation environment; automated tests exercise the OpenAI code paths through stubs.
 
 ## Development Setup
 
@@ -56,7 +66,7 @@ pytest -q
 
 ## Extending / Debugging Tips
 
-- The `VLMClient` automatically falls back to a generic JSON POST for custom providers when the endpoint is not DashScope.
+- The `VLMClient` wraps the OpenAI Responses API and returns both the Markdown text and the raw payload for auditing or caching.
 - To enable verbose logging, wrap the MCP server (`FastMCP`) invocation with your preferred logger before deploying.
 - When running OCR-heavy workloads, adjust the `options["timeout"]` value to accommodate slow downloads.
 

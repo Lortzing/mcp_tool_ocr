@@ -77,6 +77,22 @@ class _HttpxClient:
 
 _make_module("httpx", {"Client": _HttpxClient})
 
+
+class _DummyOpenAIResponse:
+    def __init__(self):
+        self.output = []
+
+    def model_dump(self):
+        return {"ok": True}
+
+
+class _DummyOpenAIClient:
+    def __init__(self, *args, **kwargs):
+        self.responses = types.SimpleNamespace(create=lambda *a, **k: _DummyOpenAIResponse())
+
+
+_make_module("openai", {"OpenAI": _DummyOpenAIClient})
+
 # fastmcp stub: set FastMCP to None so parse_document_url isn't registered (tests don't need MCP runtime)
 _make_module("fastmcp", {"FastMCP": None})
 
@@ -120,68 +136,108 @@ def test_documentprocessor_dispatch_calls_parser(monkeypatch):
     assert res == {"parsed_by": "dummy"}
 
 def test_pdfparser_triggers_ocr_and_vlm(monkeypatch):
-    """
-    验证在“可选文本为空 -> 需要 OCR -> OCR 调用并且 VLM 被触发”的主要控制流。
-    使用 fake doc + 替换 PDFParser 的局部方法，避免真实依赖 fitz/pdfplumber/camelot。
-    """
-    # 1) 准备 Fake fitz.open 返回的 doc：支持迭代/索引/len（两页）
     class FakeDoc:
         def __init__(self, n):
             self._n = n
-        def __len__(self): return self._n
+
+        def __len__(self):
+            return self._n
+
         def __iter__(self):
-            # iteration only used by our patched _extract_selectable_text (we patch it)
-            return iter([None]*self._n)
+            return iter([None] * self._n)
+
         def __getitem__(self, idx):
             return object()
 
     monkeypatch.setattr(dpr.fitz, "open", lambda *a, **k: FakeDoc(2))
-
-    # 2) 强制 selectable text 为空 => 触发 OCR（模拟返回两个页面，第一页无文本）
-    def fake_extract_selectable_text(self, doc):
-        return [{"page_number": 1, "text": ""}, {"page_number": 2, "text": "already"}]
-    monkeypatch.setattr(dpr.PDFParser, "_extract_selectable_text", fake_extract_selectable_text)
-
-    # 3) 把 _render_page_to_png 返回固定 png bytes（不使用真实渲染）
+    monkeypatch.setattr(
+        dpr.PDFParser,
+        "_extract_selectable_text",
+        lambda self, doc: [{"page_number": 1, "text": ""}, {"page_number": 2, "text": "already"}],
+    )
     monkeypatch.setattr(dpr.PDFParser, "_render_page_to_png", lambda self, page, zoom=2.0: b"PNG_BYTES")
+    monkeypatch.setattr(
+        dpr.OCRHelper,
+        "image_to_data",
+        staticmethod(lambda b, lang="eng": {"blocks": [{"text": "recognized"}]}),
+    )
 
-    # 4) 模拟 OCR 输出
-    monkeypatch.setattr(dpr.OCRHelper, "image_to_data", staticmethod(lambda b, lang="eng": {"blocks":[{"text":"recognized"}]}))
+    vlm = dpr.VLMClient(api_key="")
+    called: dict = {}
 
-    # 5) 模拟 embedded images 提取（用于 VLM 的输入）
-    monkeypatch.setattr(dpr.PDFParser, "_extract_embedded_images", lambda self, doc: [{"page":1, "bytes_b64": _b64(b"IMG1") }])
+    def fake_generate(prompt, images):
+        called["prompt"] = prompt
+        called["images"] = images
+        return {"markdown": "page markdown"}
 
-    # 6) 准备 VLMClient 实例并替换 call_sync 为可观测的 fake
-    vlm = dpr.VLMClient(endpoint="http://vlm")
-    called = {}
-    def fake_vlm_call(images_b64, ocr_text, task="document_understanding"):
-        called['imgs'] = images_b64
-        called['ocr_text'] = ocr_text
-        return {"vlm_result": "ok"}
-    monkeypatch.setattr(vlm, "call_sync", fake_vlm_call)
+    monkeypatch.setattr(vlm, "generate", fake_generate)
 
-    # 实例并调用
-    pdfp = dpr.PDFParser(use_ocr=True, vlm_client=vlm, ocr_lang="eng")
+    pdfp = dpr.PDFParser(use_ocr=True, vlm_client=vlm, ocr_lang="eng", parse_mode="ocr")
     res = pdfp.parse(b"%PDF-dummy%")
-    # 断言 OCR 已被放到页面结果中
-    assert "pages" in res
-    assert res["pages"][0].get("ocr") == {"blocks":[{"text":"recognized"}]}
-    # 断言 VLM 被调用，且传入的 images_b64 经过 base64 编码（我们在 fake_extract_embedded_images 提供了图片）
-    assert res.get("vlm") == {"vlm_result": "ok"}
-    assert isinstance(called.get("imgs"), list)
-    assert "recognized" in called.get("ocr_text", "")
+    assert res["mode"] == "ocr"
+    assert res["pages"][0]["ocr"] == {"blocks": [{"text": "recognized"}]}
+    assert res["vlm_pages"][0]["vlm"] == {"markdown": "page markdown"}
+    assert called["images"] == [dpr._b64(b"PNG_BYTES")]
+    assert "markdown" in called["prompt"].lower()
+
+
+def test_pdfparser_vlm_mode_generates_markdown(monkeypatch):
+    class FakeDoc:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            return object()
+
+    monkeypatch.setattr(dpr.fitz, "open", lambda *a, **k: FakeDoc())
+    monkeypatch.setattr(
+        dpr.PDFParser,
+        "_render_document_to_images",
+        lambda self, doc: [{"page_number": 1, "image_b64": "IMG_B64"}],
+    )
+
+    vlm = dpr.VLMClient(api_key="")
+    captured: dict = {}
+
+    def fake_generate(prompt, images):
+        captured["prompt"] = prompt
+        captured["images"] = images
+        return {"markdown": "## Page 1\nConverted"}
+
+    monkeypatch.setattr(vlm, "generate", fake_generate)
+
+    pdfp = dpr.PDFParser(use_ocr=False, vlm_client=vlm, parse_mode="vlm")
+    res = pdfp.parse(b"%PDF%")
+    assert res["mode"] == "vlm"
+    assert res["vlm"] == {"markdown": "## Page 1\nConverted"}
+    assert captured["images"] == ["IMG_B64"]
+    assert "markdown" in captured["prompt"].lower()
+
 
 def test_imageparser_ocr_and_vlm(monkeypatch):
-    # OCR fake
-    monkeypatch.setattr(dpr.OCRHelper, "image_to_data", staticmethod(lambda b, lang="eng": {"blocks":[{"text":"imgtext"}]}))
-    # VLM fake client
-    vlm = dpr.VLMClient(endpoint="http://vlm")
-    monkeypatch.setattr(vlm, "call_sync", lambda imgs, ocr_text: {"vlm_result":"img_ok"})
+    monkeypatch.setattr(
+        dpr.OCRHelper,
+        "image_to_data",
+        staticmethod(lambda b, lang="eng": {"blocks": [{"text": "imgtext"}]}),
+    )
+
+    vlm = dpr.VLMClient(api_key="")
+    called: dict = {}
+
+    def fake_generate(prompt, images):
+        called["prompt"] = prompt
+        called["images"] = images
+        return {"markdown": "image markdown"}
+
+    monkeypatch.setattr(vlm, "generate", fake_generate)
 
     ip = dpr.ImageParser(use_ocr=True, vlm_client=vlm, ocr_lang="eng")
-    res = ip.parse(b"\x89PNG...fake")
-    assert res["ocr"] == {"blocks":[{"text":"imgtext"}]}
-    assert res["vlm"] == {"vlm_result":"img_ok"}
+    image_bytes = b"\x89PNG...fake"
+    res = ip.parse(image_bytes)
+    assert res["ocr"] == {"blocks": [{"text": "imgtext"}]}
+    assert res["vlm"] == {"markdown": "image markdown"}
+    assert called["images"] == [dpr._b64(image_bytes)]
+    assert "tables" in called["prompt"].lower()
 
 def test_docxparser_parses_paragraphs_and_tables(monkeypatch):
     # fake Document object returning paragraphs and tables
