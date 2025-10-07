@@ -21,12 +21,12 @@ import pandas as pd
 import openpyxl
 from pptx import Presentation
 import httpx
+from openai import OpenAI
 
 from config import (
-    DASHSCOPE_API_KEY,
-    DASHSCOPE_ENDPOINT,
-    DASHSCOPE_MODEL,
-    DASHSCOPE_PROVIDER,
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    QWEN_VLM_MODEL,
 )
 
 from fastmcp import FastMCP
@@ -38,92 +38,97 @@ def _b64(bytestr: bytes) -> str:
 
 
 class VLMClient:
-    """VLM client (sync). assumes httpx is available and endpoint configured if used."""
+    """Minimal wrapper around the OpenAI client for multimodal interactions."""
 
     def __init__(
         self,
-        endpoint: str = "",
-        token: Optional[str] = None,
-        timeout: float = 120.0,
-        provider: str | None = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
         model: Optional[str] = None,
+        timeout: float = 120.0,
     ):
-        self.endpoint = endpoint
-        self.token = token
+        self.api_key = api_key or ""
+        self.base_url = base_url or ""
+        self.model = model or "qwen3-vl-plus"
         self.timeout = timeout
-        self.provider = (provider or "generic").lower()
-        self.model = model
+        self._client: OpenAI | None = None
+        if self.api_key:
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=timeout)
 
-    def call_sync(
-        self,
-        images_b64: List[str],
-        ocr_text: str,
-        task: str = "document_understanding",
-    ) -> Dict[str, Any]:
-        """Dispatch to the correct backend based on provider."""
+    def _ensure_client(self) -> bool:
+        if self._client is None:
+            return False
+        return True
 
-        if not self.endpoint:
-            return {"error": "VLM endpoint not configured"}
+    def _safe_dump(self, response: Any) -> Any:
+        if response is None:
+            return None
+        dump = getattr(response, "model_dump", None)
+        if callable(dump):
+            try:
+                return dump()
+            except Exception:
+                pass
+        json_fn = getattr(response, "json", None)
+        if callable(json_fn):
+            try:
+                return json.loads(json_fn())
+            except Exception:
+                pass
+        return getattr(response, "__dict__", str(response))
 
-        if "dashscope.aliyuncs.com" in self.endpoint or self.provider == "dashscope":
-            return self._call_dashscope(images_b64, ocr_text, task)
+    def _extract_text(self, response: Any) -> str:
+        if response is None:
+            return ""
+        output = getattr(response, "output", None)
+        if isinstance(output, list):
+            collected: List[str] = []
+            for item in output:
+                contents = getattr(item, "content", None)
+                if isinstance(contents, list):
+                    for content in contents:
+                        text = getattr(content, "text", None) or getattr(content, "value", None)
+                        if isinstance(text, str):
+                            collected.append(text)
+            if collected:
+                return "".join(collected)
 
-        headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        payload = {"images_b64": images_b64, "ocr_text": ocr_text, "task": task}
-        try:
-            with httpx.Client(timeout=self.timeout) as client:
-                resp = client.post(self.endpoint, json=payload, headers=headers)
-                resp.raise_for_status()
-                return {"vlm_result": resp.json()}
-        except Exception as e:
-            return {"error": f"VLM call failed: {str(e)}"}
+        choices = getattr(response, "choices", None)
+        if isinstance(choices, list):
+            texts = []
+            for choice in choices:
+                message = getattr(choice, "message", None)
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        texts.append(content)
+                elif hasattr(message, "content"):
+                    content = getattr(message, "content")
+                    if isinstance(content, str):
+                        texts.append(content)
+            if texts:
+                return "".join(texts)
+        return ""
 
-    def _call_dashscope(self, images_b64: List[str], ocr_text: str, task: str) -> Dict[str, Any]:
-        """Call Qwen2.5-VL through DashScope's OpenAI-compatible endpoint."""
+    def generate(self, prompt: str, images_b64: List[str]) -> Dict[str, Any]:
+        if not self._ensure_client():
+            return {"error": "OpenAI client not configured"}
 
-        if not self.token:
-            return {"error": "DashScope VLM requires an access token"}
-
-        model = self.model or "qwen2.5-vl"
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"}
-        messages_content: List[Dict[str, Any]] = []
-        if ocr_text:
-            messages_content.append(
-                {
-                    "type": "input_text",
-                    "text": f"Task: {task}\nOCR Context:\n{ocr_text}",
-                }
-            )
-        else:
-            messages_content.append({"type": "input_text", "text": f"Task: {task}"})
-
+        content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
         for img in images_b64:
-            messages_content.append({"type": "input_image", "image": img})
-
-        payload = {
-            "model": model,
-            "input": [
-                {
-                    "role": "user",
-                    "content": messages_content,
-                }
-            ],
-        }
-
-        endpoint = self.endpoint.rstrip("/")
-        # DashScope uses /responses for the OpenAI compatible format.
-        if not endpoint.endswith("/responses"):
-            endpoint = f"{endpoint}/responses"
+            content.append({"type": "input_image", "image": {"base64": img}})
 
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                resp = client.post(endpoint, json=payload, headers=headers)
-                resp.raise_for_status()
-                return {"vlm_result": resp.json()}
-        except Exception as e:
-            return {"error": f"DashScope VLM call failed: {str(e)}"}
+            response = self._client.responses.create(
+                model=self.model,
+                input=[{"role": "user", "content": content}],
+            )
+            return {
+                "markdown": self._extract_text(response),
+                "raw": self._safe_dump(response),
+            }
+        except Exception as exc:
+            return {"error": f"OpenAI call failed: {exc}"}
 
 
 class OCRHelper:
@@ -178,7 +183,12 @@ class OCRHelper:
 # -------------------------
 
 class BaseParser:
-    def __init__(self, use_ocr: bool = False, vlm_client: Optional[VLMClient] = None, ocr_lang: str | List[str] = "eng"):
+    def __init__(
+        self,
+        use_ocr: bool = False,
+        vlm_client: Optional[VLMClient] = None,
+        ocr_lang: str | List[str] = "eng",
+    ):
         # OCR is disabled by default. We keep the flag for backwards compatibility
         # but avoid invoking OCR logic in new flows unless explicitly requested.
         self.use_ocr = use_ocr
@@ -190,10 +200,20 @@ class BaseParser:
 
 
 class PDFParser(BaseParser):
-    def __init__(self, *args, camelot_enable: bool = True, pdfplumber_enable: bool = True, **kwargs):
+    def __init__(
+        self,
+        *args,
+        camelot_enable: bool = True,
+        pdfplumber_enable: bool = True,
+        parse_mode: str = "ocr",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.camelot_enable = camelot_enable
         self.pdfplumber_enable = pdfplumber_enable
+        self.parse_mode = parse_mode.lower()
+        if self.parse_mode not in {"ocr", "vlm"}:
+            self.parse_mode = "ocr"
 
     def _extract_selectable_text(self, doc) -> List[Dict[str, Any]]:
         pages = []
@@ -270,39 +290,50 @@ class PDFParser(BaseParser):
 
     def parse(self, data: bytes) -> Dict[str, Any]:
         start = time.time()
-        result: Dict[str, Any] = {"code": 0, "type": "pdf", "pages": [], "tables": {}, "images": [], "warnings": []}
         try:
             doc = fitz.open(stream=data, filetype="pdf")
         except Exception as e:
             return {"error": "failed to open pdf with pymupdf", "details": str(e)}
 
-        # selectable text
+        if self.parse_mode == "vlm":
+            return self._parse_with_vlm(doc, start)
+        return self._parse_with_ocr(data, doc, start)
+
+    def _parse_with_ocr(self, pdf_bytes: bytes, doc, start: float) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "code": 0,
+            "type": "pdf",
+            "mode": "ocr",
+            "pages": [],
+            "tables": {},
+            "images": [],
+            "warnings": [],
+        }
+
         try:
             result["pages"] = self._extract_selectable_text(doc)
         except Exception as e:
             result["warnings"].append(f"pymupdf text extraction failed: {str(e)}")
 
-        # tables
         if self.pdfplumber_enable:
             try:
-                result["tables_pdfplumber"] = self._extract_tables_pdfplumber(data)
+                result["tables_pdfplumber"] = self._extract_tables_pdfplumber(pdf_bytes)
             except Exception as e:
                 result["warnings"].append(f"pdfplumber failed: {str(e)}")
 
         if self.camelot_enable:
             try:
-                result["tables_camelot"] = self._extract_tables_camelot(data)
+                result["tables_camelot"] = self._extract_tables_camelot(pdf_bytes)
             except Exception as e:
                 result["warnings"].append(f"camelot failed: {str(e)}")
 
-        # pages that need OCR
-        need_ocr_pages = []
+        need_ocr_pages: List[int] = []
         try:
-            if not result["pages"] or any((not p.get("text", "").strip()) for p in result["pages"]):
-                if result.get("pages"):
-                    need_ocr_pages = [i for i, p in enumerate(result.get("pages", [])) if not p.get("text", "").strip()]
-                else:
-                    need_ocr_pages = list(range(len(doc)))
+            pages = result.get("pages", [])
+            if not pages:
+                need_ocr_pages = list(range(len(doc)))
+            else:
+                need_ocr_pages = [i for i, page in enumerate(pages) if not page.get("text", "").strip()]
         except Exception:
             need_ocr_pages = list(range(len(doc)))
 
@@ -311,15 +342,23 @@ class PDFParser(BaseParser):
             try:
                 page = doc[pnum]
                 img_bytes = self._render_page_to_png(page, zoom=2.0)
-                if self.vlm_client and self.vlm_client.endpoint:
-                    vlm_response = self.vlm_client.call_sync([_b64(img_bytes)], "")
+                if self.use_ocr:
+                    try:
+                        ocr_result = OCRHelper.image_to_data(img_bytes, lang=self.ocr_lang)
+                    except Exception as ocr_err:
+                        ocr_result = {"error": str(ocr_err)}
+                    if len(result["pages"]) > pnum:
+                        result["pages"][pnum]["ocr"] = ocr_result
+
+                if self.vlm_client:
+                    prompt = self._build_pdf_page_prompt(pnum + 1)
+                    vlm_response = self.vlm_client.generate(prompt, [_b64(img_bytes)])
                 else:
-                    vlm_response = {"error": "vlm endpoint not configured"}
+                    vlm_response = {"error": "OpenAI client not configured"}
                 vlm_page_results.append({"page_number": pnum + 1, "vlm": vlm_response})
             except Exception as e:
-                result["warnings"].append(f"VLM analysis failed on page {pnum+1}: {str(e)}")
+                result["warnings"].append(f"analysis failed on page {pnum + 1}: {str(e)}")
 
-        # embedded images
         try:
             result["images"] = self._extract_embedded_images(doc)
         except Exception as e:
@@ -331,22 +370,99 @@ class PDFParser(BaseParser):
         result["elapsed_seconds"] = time.time() - start
         return result
 
+    def _build_pdf_page_prompt(self, page_number: int) -> str:
+        return (
+            "You are converting scanned PDF pages into structured Markdown. "
+            f"Transcribe all readable content on page {page_number} from the provided image. "
+            "Use Markdown headings, lists and tables whenever appropriate, and render mathematics "
+            "using LaTeX syntax between $...$ or $$...$$. Describe figures or charts in one or two "
+            "sentences placed where they appear in the page. Respond with Markdown only."
+        )
+
+    def _render_document_to_images(self, doc) -> List[Dict[str, Any]]:
+        images: List[Dict[str, Any]] = []
+        for idx in range(len(doc)):
+            try:
+                png_bytes = self._render_page_to_png(doc[idx], zoom=2.0)
+                images.append({"page_number": idx + 1, "image_b64": _b64(png_bytes)})
+            except Exception:
+                images.append({"page_number": idx + 1, "error": "render_failed"})
+        return images
+
+    def _build_pdf_document_prompt(self, page_images: List[Dict[str, Any]]) -> str:
+        total_pages = len(page_images)
+        return (
+            "You are an expert assistant that converts PDF documents into high quality Markdown. "
+            f"The user will provide {total_pages} page image(s). Process them in order, producing "
+            "Markdown that mirrors the layout and reading order. Follow these rules:\n"
+            "1. Preserve all textual content faithfully.\n"
+            "2. Use Markdown tables for tabular data.\n"
+            "3. Replace charts, figures or photos with concise descriptive captions at the same position.\n"
+            "4. Render mathematics using LaTeX syntax inside $...$ or $$...$$.\n"
+            "5. Start each page with a heading like '## Page X' to maintain pagination.\n"
+            "Return only Markdown without additional commentary."
+        )
+
+    def _parse_with_vlm(self, doc, start: float) -> Dict[str, Any]:
+        page_images = self._render_document_to_images(doc)
+        images_payload = [item.get("image_b64") for item in page_images if "image_b64" in item]
+
+        if not images_payload:
+            return {
+                "error": "pdf to image conversion failed",
+                "details": page_images,
+            }
+
+        if not self.vlm_client:
+            vlm_response = {"error": "OpenAI client not configured"}
+        else:
+            prompt = self._build_pdf_document_prompt(page_images)
+            vlm_response = self.vlm_client.generate(prompt, images_payload)
+
+        return {
+            "code": 0,
+            "type": "pdf",
+            "mode": "vlm",
+            "pages": [{"page_number": item["page_number"]} for item in page_images],
+            "page_images": page_images,
+            "vlm": vlm_response,
+            "elapsed_seconds": time.time() - start,
+        }
+
 
 class ImageParser(BaseParser):
     def parse(self, data: bytes) -> Dict[str, Any]:
         start = time.time()
         result: Dict[str, Any] = {"code": 0, "type": "image", "vlm": None, "elapsed_seconds": None}
-        if self.vlm_client and self.vlm_client.endpoint:
+        img_b64 = _b64(data)
+
+        if self.use_ocr:
             try:
-                img_b64 = _b64(data)
-                vlm_res = self.vlm_client.call_sync([img_b64], "")
+                result["ocr"] = OCRHelper.image_to_data(data, lang=self.ocr_lang)
+            except Exception as e:
+                result["ocr"] = {"error": str(e)}
+
+        if self.vlm_client:
+            try:
+                prompt = self._build_image_prompt()
+                vlm_res = self.vlm_client.generate(prompt, [img_b64])
                 result["vlm"] = vlm_res
             except Exception as e:
                 result["vlm"] = {"error": str(e)}
         else:
-            result["vlm"] = {"error": "vlm endpoint not configured"}
+            result["vlm"] = {"error": "OpenAI client not configured"}
         result["elapsed_seconds"] = time.time() - start
         return result
+
+    @staticmethod
+    def _build_image_prompt() -> str:
+        return (
+            "You are analysing a single image. Extract every readable text segment, "
+            "describe the visual elements and layout, and reproduce any tables using "
+            "Markdown table syntax. When mathematical expressions appear, rewrite them "
+            "using LaTeX math enclosed in $...$ or $$...$$. Respond with concise Markdown "
+            "combining the transcription and the scene description."
+        )
 
 
 class DocxParser(BaseParser):
@@ -368,10 +484,11 @@ class DocxParser(BaseParser):
                 for rel in rels:
                     if "image" in rel.reltype:
                         blob = rel.target_part.blob
-                        if self.vlm_client and self.vlm_client.endpoint:
-                            vlm_res = self.vlm_client.call_sync([_b64(blob)], "")
+                        if self.vlm_client:
+                            prompt = ImageParser._build_image_prompt()
+                            vlm_res = self.vlm_client.generate(prompt, [_b64(blob)])
                         else:
-                            vlm_res = {"error": "vlm endpoint not configured"}
+                            vlm_res = {"error": "OpenAI client not configured"}
                         images_vlm.append({"vlm": vlm_res})
             except Exception as e:
                 images_vlm.append({"error": f"failed to analyse images: {str(e)}"})
@@ -441,13 +558,14 @@ class PptxParser(BaseParser):
 
         images_vlm_results: List[Dict[str, Any]] = []
         for img in images_out:
-            if self.vlm_client and self.vlm_client.endpoint:
+            if self.vlm_client:
                 try:
-                    vlm_res = self.vlm_client.call_sync([img["bytes_b64"]], "")
+                    prompt = ImageParser._build_image_prompt()
+                    vlm_res = self.vlm_client.generate(prompt, [img["bytes_b64"]])
                 except Exception as e:
                     vlm_res = {"error": str(e)}
             else:
-                vlm_res = {"error": "vlm endpoint not configured"}
+                vlm_res = {"error": "OpenAI client not configured"}
             images_vlm_results.append({"slide": img.get("slide"), "vlm": vlm_res})
 
         return {
@@ -471,16 +589,15 @@ class DocumentProcessor:
         ocr_lang: str = "eng",
         camelot_enable: bool = True,
         pdfplumber_enable: bool = True,
+        pdf_parse_mode: str = "ocr",
     ):
-        resolved_endpoint = DASHSCOPE_ENDPOINT
-        resolved_token = DASHSCOPE_API_KEY
-        resolved_provider = DASHSCOPE_PROVIDER
-        resolved_model = DASHSCOPE_MODEL
+        resolved_base_url = OPENAI_BASE_URL
+        resolved_token = OPENAI_API_KEY
+        resolved_model = QWEN_VLM_MODEL
 
         self.vlm_client = VLMClient(
-            endpoint=resolved_endpoint,
-            token=resolved_token,
-            provider=resolved_provider,
+            api_key=resolved_token,
+            base_url=resolved_base_url,
             model=resolved_model,
         )
 
@@ -488,11 +605,21 @@ class DocumentProcessor:
         self.ocr_lang = ocr_lang
         self.camelot_enable = camelot_enable
         self.pdfplumber_enable = pdfplumber_enable
+        self.pdf_parse_mode = pdf_parse_mode.lower() if isinstance(pdf_parse_mode, str) else "ocr"
+        if self.pdf_parse_mode not in {"ocr", "vlm"}:
+            self.pdf_parse_mode = "ocr"
 
     def _select_parser(self, filename: str) -> BaseParser:
         lower = filename.lower()
         if lower.endswith(".pdf"):
-            return PDFParser(use_ocr=self.use_ocr, vlm_client=self.vlm_client, ocr_lang=self.ocr_lang, camelot_enable=self.camelot_enable, pdfplumber_enable=self.pdfplumber_enable)
+            return PDFParser(
+                use_ocr=self.use_ocr,
+                vlm_client=self.vlm_client,
+                ocr_lang=self.ocr_lang,
+                camelot_enable=self.camelot_enable,
+                pdfplumber_enable=self.pdfplumber_enable,
+                parse_mode=self.pdf_parse_mode,
+            )
         if any(lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"]):
             return ImageParser(use_ocr=self.use_ocr, vlm_client=self.vlm_client, ocr_lang=self.ocr_lang)
         if lower.endswith(".docx") or lower.endswith(".doc"):
@@ -538,6 +665,7 @@ if mcp:
             ocr_lang=opts.get("ocr_lang", "eng"),
             camelot_enable=opts.get("camelot_enable", True),
             pdfplumber_enable=opts.get("pdfplumber_enable", True),
+            pdf_parse_mode=opts.get("pdf_parse_mode", "ocr"),
         )
 
         try:
