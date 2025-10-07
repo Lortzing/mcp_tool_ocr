@@ -13,7 +13,7 @@ async def main():
         result = await client.call_tool(
             "parse_document_url",
             {
-                "file_url": "http://localhost:5050/example_files/test_docx.docx",
+                "file_url": "http://localhost:5050/example_files/test_ocr.png",
                 "run_vlm": False,
                 "use_ocr": False,
                 "ocr_lang": "eng",

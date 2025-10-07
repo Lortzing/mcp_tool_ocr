@@ -468,29 +468,22 @@ class DocumentProcessor:
     def __init__(
         self,
         use_ocr: bool = False,
-        vlm_endpoint: Optional[str] = None,
-        vlm_token: Optional[str] = None,
         ocr_lang: str = "eng",
         camelot_enable: bool = True,
         pdfplumber_enable: bool = True,
-        vlm_provider: Optional[str] = None,
-        vlm_model: Optional[str] = None,
-        enable_vlm: bool = False,
     ):
-        if enable_vlm:
-            resolved_endpoint = vlm_endpoint or DASHSCOPE_ENDPOINT
-            resolved_token = vlm_token or DASHSCOPE_API_KEY
-            resolved_provider = (vlm_provider or DASHSCOPE_PROVIDER) if DASHSCOPE_PROVIDER else vlm_provider
-            resolved_model = vlm_model or DASHSCOPE_MODEL
+        resolved_endpoint = DASHSCOPE_ENDPOINT
+        resolved_token = DASHSCOPE_API_KEY
+        resolved_provider = DASHSCOPE_PROVIDER
+        resolved_model = DASHSCOPE_MODEL
 
-            self.vlm_client = VLMClient(
-                endpoint=resolved_endpoint,
-                token=resolved_token,
-                provider=resolved_provider,
-                model=resolved_model,
-            )
-        else:
-            self.vlm_client = None
+        self.vlm_client = VLMClient(
+            endpoint=resolved_endpoint,
+            token=resolved_token,
+            provider=resolved_provider,
+            model=resolved_model,
+        )
+
         self.use_ocr = use_ocr
         self.ocr_lang = ocr_lang
         self.camelot_enable = camelot_enable
@@ -539,26 +532,12 @@ if mcp:
             return {"error": f"Failed to fetch file: {str(e)}"}
 
         filename = os.path.basename(urllib.parse.urlparse(file_url).path) or "downloaded_file"
-
-        run_vlm = opts.get("run_vlm", False)
-        vlm_api_url = opts.get("vlm_api_url")
-        vlm_token = opts.get("vlm_token")
-        vlm_model = opts.get("vlm_model")
-        vlm_provider = opts.get("vlm_provider")
-
-        if not vlm_provider and isinstance(vlm_api_url, str) and "dashscope.aliyuncs.com" in vlm_api_url:
-            vlm_provider = "dashscope"
-
+        
         dp = DocumentProcessor(
             use_ocr=opts.get("use_ocr", False),
-            vlm_endpoint=vlm_api_url if run_vlm and vlm_api_url else None,
-            vlm_token=vlm_token,
             ocr_lang=opts.get("ocr_lang", "eng"),
             camelot_enable=opts.get("camelot_enable", True),
             pdfplumber_enable=opts.get("pdfplumber_enable", True),
-            vlm_provider=vlm_provider,
-            vlm_model=vlm_model,
-            enable_vlm=run_vlm,
         )
 
         try:
