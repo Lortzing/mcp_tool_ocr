@@ -8,6 +8,8 @@ import json
 import base64
 import traceback
 import urllib.parse
+import asyncio
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
 import fitz
@@ -131,6 +133,50 @@ class VLMClient:
             return {"error": f"OpenAI call failed: {exc}"}
 
 
+@dataclass
+class VLMRequest:
+    prompt: str
+    images_b64: List[str]
+
+
+class VLMTaskManager:
+    """Manage asynchronous VLM invocations with a concurrency ceiling."""
+
+    def __init__(self, client: Optional[VLMClient], max_concurrent: int = 5):
+        self.client = client
+        self.max_concurrent = max(1, min(max_concurrent, 5))
+
+    async def _run_all(self, requests: List[VLMRequest]) -> List[Dict[str, Any]]:
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+
+        async def _task(request: VLMRequest) -> Dict[str, Any]:
+            if not self.client:
+                return {"error": "OpenAI client not configured"}
+            if not request.images_b64:
+                return {"error": "No images provided for VLM request"}
+            async with semaphore:
+                try:
+                    return await asyncio.to_thread(
+                        self.client.generate, request.prompt, request.images_b64
+                    )
+                except Exception as exc:
+                    return {"error": f"OpenAI call failed: {exc}"}
+
+        tasks = [_task(req) for req in requests]
+        return await asyncio.gather(*tasks)
+
+    def run_requests(self, requests: List[VLMRequest]) -> List[Dict[str, Any]]:
+        if not requests:
+            return []
+        if not self.client:
+            return [{"error": "OpenAI client not configured"} for _ in requests]
+        return asyncio.run(self._run_all(requests))
+
+    def run_single(self, request: VLMRequest) -> Dict[str, Any]:
+        results = self.run_requests([request])
+        return results[0] if results else {"error": "OpenAI client not configured"}
+
+
 class OCRHelper:
     @staticmethod
     def _normalize_lang(lang: str | List[str]) -> str:
@@ -187,12 +233,14 @@ class BaseParser:
         self,
         use_ocr: bool = False,
         vlm_client: Optional[VLMClient] = None,
+        vlm_manager: Optional[VLMTaskManager] = None,
         ocr_lang: str | List[str] = "eng",
     ):
         # OCR is disabled by default. We keep the flag for backwards compatibility
         # but avoid invoking OCR logic in new flows unless explicitly requested.
         self.use_ocr = use_ocr
         self.vlm_client = vlm_client
+        self.vlm_manager = vlm_manager or (VLMTaskManager(vlm_client) if vlm_client else None)
         self.ocr_lang = ocr_lang
 
     def parse(self, data: bytes) -> Dict[str, Any]:
@@ -222,7 +270,11 @@ class PDFParser(BaseParser):
                 text = page.get_text("text", sort=True)
             except Exception:
                 text = ""
-            pages.append({"page_number": i + 1, "text": text})
+            normalized = text or ""
+            elements: List[Dict[str, Any]] = []
+            if normalized.strip():
+                elements.append({"type": "text", "order": 1, "text": normalized})
+            pages.append({"page_number": i + 1, "text": normalized, "elements": elements})
         return pages
 
     def _extract_tables_pdfplumber(self, pdf_bytes: bytes) -> Dict[str, Any]:
@@ -288,6 +340,12 @@ class PDFParser(BaseParser):
                     continue
         return images_out
 
+    @staticmethod
+    def _append_page_element(page_entry: Dict[str, Any], element: Dict[str, Any]) -> None:
+        elements = page_entry.setdefault("elements", [])
+        element["order"] = len(elements) + 1
+        elements.append(element)
+
     def parse(self, data: bytes) -> Dict[str, Any]:
         start = time.time()
         try:
@@ -317,13 +375,27 @@ class PDFParser(BaseParser):
 
         if self.pdfplumber_enable:
             try:
-                result["tables_pdfplumber"] = self._extract_tables_pdfplumber(pdf_bytes)
+                pdfplumber_tables = self._extract_tables_pdfplumber(pdf_bytes)
+                result["tables_pdfplumber"] = pdfplumber_tables
+                for page_tables in pdfplumber_tables.get("pages", []):
+                    page_number = page_tables.get("page_number")
+                    if not isinstance(page_number, int):
+                        continue
+                    index = page_number - 1
+                    if 0 <= index < len(result.get("pages", [])):
+                        page_entry = result["pages"][index]
+                        for table in page_tables.get("tables", []):
+                            self._append_page_element(
+                                page_entry,
+                                {"type": "table", "source": "pdfplumber", "table": table},
+                            )
             except Exception as e:
                 result["warnings"].append(f"pdfplumber failed: {str(e)}")
 
         if self.camelot_enable:
             try:
-                result["tables_camelot"] = self._extract_tables_camelot(pdf_bytes)
+                camelot_tables = self._extract_tables_camelot(pdf_bytes)
+                result["tables_camelot"] = camelot_tables
             except Exception as e:
                 result["warnings"].append(f"camelot failed: {str(e)}")
 
@@ -338,6 +410,8 @@ class PDFParser(BaseParser):
             need_ocr_pages = list(range(len(doc)))
 
         vlm_page_results: List[Dict[str, Any]] = []
+        vlm_requests: List[VLMRequest] = []
+        vlm_request_metadata: List[Dict[str, Any]] = []
         for pnum in need_ocr_pages:
             try:
                 page = doc[pnum]
@@ -347,15 +421,26 @@ class PDFParser(BaseParser):
                         ocr_result = OCRHelper.image_to_data(img_bytes, lang=self.ocr_lang)
                     except Exception as ocr_err:
                         ocr_result = {"error": str(ocr_err)}
-                    if len(result["pages"]) > pnum:
-                        result["pages"][pnum]["ocr"] = ocr_result
+                    while len(result["pages"]) <= pnum:
+                        result["pages"].append({"page_number": len(result["pages"]) + 1, "text": "", "elements": []})
+                    result["pages"][pnum]["ocr"] = ocr_result
+                    self._append_page_element(result["pages"][pnum], {"type": "ocr_text", "ocr": ocr_result})
 
-                if self.vlm_client:
+                while len(result["pages"]) <= pnum:
+                    result["pages"].append({"page_number": len(result["pages"]) + 1, "text": "", "elements": []})
+
+                page_entry = result["pages"][pnum]
+
+                if self.vlm_manager:
                     prompt = self._build_pdf_page_prompt(pnum + 1)
-                    vlm_response = self.vlm_client.generate(prompt, [_b64(img_bytes)])
+                    placeholder = {"type": "vlm_markdown", "vlm": None}
+                    self._append_page_element(page_entry, placeholder)
+                    vlm_requests.append(VLMRequest(prompt=prompt, images_b64=[_b64(img_bytes)]))
+                    vlm_request_metadata.append({"page_number": pnum + 1, "placeholder": placeholder})
                 else:
                     vlm_response = {"error": "OpenAI client not configured"}
-                vlm_page_results.append({"page_number": pnum + 1, "vlm": vlm_response})
+                    self._append_page_element(page_entry, {"type": "vlm_markdown", "vlm": vlm_response})
+                    vlm_page_results.append({"page_number": pnum + 1, "vlm": vlm_response})
             except Exception as e:
                 result["warnings"].append(f"analysis failed on page {pnum + 1}: {str(e)}")
 
@@ -363,6 +448,26 @@ class PDFParser(BaseParser):
             result["images"] = self._extract_embedded_images(doc)
         except Exception as e:
             result["warnings"].append(f"extract embedded images failed: {str(e)}")
+        else:
+            for img in result.get("images", []):
+                page_number = img.get("page")
+                if not isinstance(page_number, int):
+                    continue
+                index = page_number - 1
+                if 0 <= index < len(result.get("pages", [])):
+                    page_entry = result["pages"][index]
+                    self._append_page_element(
+                        page_entry,
+                        {"type": "image", "bytes_b64": img.get("bytes_b64")},
+                    )
+
+        if vlm_requests and self.vlm_manager:
+            responses = self.vlm_manager.run_requests(vlm_requests)
+            for meta, resp in zip(vlm_request_metadata, responses):
+                meta_placeholder = meta.get("placeholder")
+                if isinstance(meta_placeholder, dict):
+                    meta_placeholder["vlm"] = resp
+                vlm_page_results.append({"page_number": meta.get("page_number"), "vlm": resp})
 
         if vlm_page_results:
             result["vlm_pages"] = vlm_page_results
@@ -413,19 +518,32 @@ class PDFParser(BaseParser):
                 "details": page_images,
             }
 
-        if not self.vlm_client:
+        pages_metadata = []
+        for item in page_images:
+            entry = {"page_number": item.get("page_number"), "elements": []}
+            image_b64 = item.get("image_b64")
+            if image_b64:
+                self._append_page_element(entry, {"type": "image", "image_b64": image_b64})
+            pages_metadata.append(entry)
+
+        if not self.vlm_manager:
             vlm_response = {"error": "OpenAI client not configured"}
         else:
             prompt = self._build_pdf_document_prompt(page_images)
-            vlm_response = self.vlm_client.generate(prompt, images_payload)
+            vlm_response = self.vlm_manager.run_single(VLMRequest(prompt=prompt, images_b64=images_payload))
+
+        document_elements = []
+        if vlm_response:
+            document_elements.append({"type": "vlm_markdown", "order": 1, "vlm": vlm_response})
 
         return {
             "code": 0,
             "type": "pdf",
             "mode": "vlm",
-            "pages": [{"page_number": item["page_number"]} for item in page_images],
+            "pages": pages_metadata,
             "page_images": page_images,
             "vlm": vlm_response,
+            "document_elements": document_elements,
             "elapsed_seconds": time.time() - start,
         }
 
@@ -435,22 +553,26 @@ class ImageParser(BaseParser):
         start = time.time()
         result: Dict[str, Any] = {"code": 0, "type": "image", "vlm": None, "elapsed_seconds": None}
         img_b64 = _b64(data)
+        content_flow: List[Dict[str, Any]] = [{"type": "image", "order": 1, "image_b64": img_b64}]
 
         if self.use_ocr:
             try:
                 result["ocr"] = OCRHelper.image_to_data(data, lang=self.ocr_lang)
             except Exception as e:
                 result["ocr"] = {"error": str(e)}
+            content_flow.append({"type": "ocr_text", "order": len(content_flow) + 1, "ocr": result["ocr"]})
 
-        if self.vlm_client:
+        if self.vlm_manager:
             try:
                 prompt = self._build_image_prompt()
-                vlm_res = self.vlm_client.generate(prompt, [img_b64])
+                vlm_res = self.vlm_manager.run_single(VLMRequest(prompt=prompt, images_b64=[img_b64]))
                 result["vlm"] = vlm_res
             except Exception as e:
                 result["vlm"] = {"error": str(e)}
         else:
             result["vlm"] = {"error": "OpenAI client not configured"}
+        content_flow.append({"type": "vlm_markdown", "order": len(content_flow) + 1, "vlm": result["vlm"]})
+        result["content_flow"] = content_flow
         result["elapsed_seconds"] = time.time() - start
         return result
 
@@ -466,37 +588,111 @@ class ImageParser(BaseParser):
 
 
 class DocxParser(BaseParser):
+    @staticmethod
+    def _iter_blocks(doc) -> List[Any]:
+        try:
+            from docx.oxml.table import CT_Tbl  # type: ignore
+            from docx.oxml.text.paragraph import CT_P  # type: ignore
+            from docx.table import Table as DocxTable  # type: ignore
+            from docx.text.paragraph import Paragraph  # type: ignore
+
+            if hasattr(doc, "element") and hasattr(doc.element, "body"):
+                for child in doc.element.body.iterchildren():  # type: ignore[attr-defined]
+                    if isinstance(child, CT_P):
+                        yield "paragraph", Paragraph(child, doc)
+                    elif isinstance(child, CT_Tbl):
+                        yield "table", DocxTable(child, doc)
+                return
+        except Exception:
+            pass
+
+        for para in getattr(doc, "paragraphs", []):
+            yield "paragraph", para
+        for table in getattr(doc, "tables", []):
+            yield "table", table
+
     def parse(self, data: bytes) -> Dict[str, Any]:
         start = time.time()
         try:
             doc = docx.Document(io.BytesIO(data))
-            paras = [p.text for p in doc.paragraphs if p.text.strip()]
-            tables = []
-            for table in doc.tables:
-                rows = []
-                for r in table.rows:
-                    cells = [c.text for c in r.cells]
-                    rows.append(cells)
-                tables.append(rows)
+            paragraphs: List[str] = []
+            tables: List[List[List[str]]] = []
+            flow: List[Dict[str, Any]] = []
+
+            for block_type, block in self._iter_blocks(doc):
+                if block_type == "paragraph":
+                    text = getattr(block, "text", "")
+                    cleaned = text.strip()
+                    if cleaned:
+                        idx = len(paragraphs)
+                        paragraphs.append(cleaned)
+                        flow.append({"type": "paragraph", "index": idx, "order": len(flow) + 1, "text": cleaned})
+                elif block_type == "table":
+                    rows: List[List[str]] = []
+                    for r in getattr(block, "rows", []):
+                        row_cells = [getattr(c, "text", "") for c in getattr(r, "cells", [])]
+                        rows.append(row_cells)
+                    idx = len(tables)
+                    tables.append(rows)
+                    flow.append({"type": "table", "index": idx, "order": len(flow) + 1, "rows": rows})
+
+            images: List[Dict[str, Any]] = []
             images_vlm: List[Dict[str, Any]] = []
+            vlm_jobs: List[Dict[str, Any]] = []
+            rels_iterable: List[Any] = []
             try:
-                rels = doc.part.rels.values()
-                for rel in rels:
-                    if "image" in rel.reltype:
+                part = getattr(doc, "part", None)
+                rels = getattr(part, "rels", None)
+                if rels is not None:
+                    rels_iterable = list(rels.values())  # type: ignore[call-arg]
+            except Exception:
+                rels_iterable = []
+
+            for rel in rels_iterable:
+                try:
+                    if "image" in getattr(rel, "reltype", ""):
                         blob = rel.target_part.blob
-                        if self.vlm_client:
+                        image_b64 = _b64(blob)
+                        image_entry = {"bytes_b64": image_b64, "vlm": None}
+                        images.append(image_entry)
+                        flow.append(
+                            {
+                                "type": "image",
+                                "index": len(images) - 1,
+                                "order": len(flow) + 1,
+                                "bytes_b64": image_b64,
+                            }
+                        )
+                        if self.vlm_manager:
                             prompt = ImageParser._build_image_prompt()
-                            vlm_res = self.vlm_client.generate(prompt, [_b64(blob)])
+                            vlm_jobs.append(
+                                {
+                                    "request": VLMRequest(prompt=prompt, images_b64=[image_b64]),
+                                    "image": image_entry,
+                                    "order": len(flow),
+                                }
+                            )
                         else:
-                            vlm_res = {"error": "OpenAI client not configured"}
-                        images_vlm.append({"vlm": vlm_res})
-            except Exception as e:
-                images_vlm.append({"error": f"failed to analyse images: {str(e)}"})
+                            error_res = {"error": "OpenAI client not configured"}
+                            image_entry["vlm"] = error_res
+                            images_vlm.append({"order": len(flow), "vlm": error_res})
+                except Exception as exc:
+                    images_vlm.append({"error": f"failed to analyse images: {str(exc)}"})
+
+            if vlm_jobs and self.vlm_manager:
+                responses = self.vlm_manager.run_requests([job["request"] for job in vlm_jobs])
+                for job, resp in zip(vlm_jobs, responses):
+                    job["image"]["vlm"] = resp
+                    images_vlm.append({"order": job["order"], "vlm": resp})
+
+            if images_vlm:
+                images_vlm.sort(key=lambda item: item.get("order", float("inf")))
 
             return {
                 "code": 0,
                 "type": "docx",
-                "content": {"paragraphs": paras, "tables": tables},
+                "content": {"paragraphs": paragraphs, "tables": tables, "flow": flow},
+                "images": images,
                 "images_vlm": images_vlm,
                 "elapsed_seconds": time.time() - start,
             }
@@ -528,45 +724,76 @@ class PptxParser(BaseParser):
 
         slides_out = []
         images_out = []
+        image_jobs: List[Dict[str, Any]] = []
         for i, slide in enumerate(prs.slides):
             slide_text_chunks = []
             notes_text = None
+            elements: List[Dict[str, Any]] = []
             try:
                 for shape in slide.shapes:
                     if getattr(shape, "has_text_frame", False):
                         text = shape.text_frame.text.strip()
                         if text:
                             slide_text_chunks.append(text)
+                            elements.append({"type": "text", "order": len(elements) + 1, "text": text})
 
                     # 提取图片
                     try:
                         image = getattr(shape, "image", None)
                         if image is not None:
                             blob = image.blob
-                            images_out.append({"slide": i + 1, "bytes_b64": _b64(blob)})
+                            img_b64 = _b64(blob)
+                            image_entry = {"slide": i + 1, "bytes_b64": img_b64, "vlm": None}
+                            images_out.append(image_entry)
+                            image_element = {
+                                "type": "image",
+                                "order": len(elements) + 1,
+                                "bytes_b64": img_b64,
+                                "image_index": len(images_out) - 1,
+                            }
+                            elements.append(image_element)
+                            if self.vlm_manager:
+                                prompt = ImageParser._build_image_prompt()
+                                image_jobs.append(
+                                    {
+                                        "request": VLMRequest(prompt=prompt, images_b64=[img_b64]),
+                                        "entry": image_entry,
+                                        "element": image_element,
+                                        "slide": i + 1,
+                                    }
+                                )
+                            else:
+                                error_res = {"error": "OpenAI client not configured"}
+                                image_entry["vlm"] = error_res
+                                image_element["vlm"] = error_res
                     except Exception:
                         pass
 
                 try:
                     if getattr(slide, "notes_slide", None) is not None and getattr(slide.notes_slide, "notes_text_frame", None) is not None:
                         notes_text = slide.notes_slide.notes_text_frame.text
+                        if notes_text:
+                            elements.append({"type": "notes", "order": len(elements) + 1, "text": notes_text})
                 except Exception:
                     notes_text = None
             except Exception:
                 pass
-            slides_out.append({"slide_number": i + 1, "texts": slide_text_chunks, "notes": notes_text})
+            slides_out.append({"slide_number": i + 1, "texts": slide_text_chunks, "notes": notes_text, "elements": elements})
 
         images_vlm_results: List[Dict[str, Any]] = []
-        for img in images_out:
-            if self.vlm_client:
-                try:
-                    prompt = ImageParser._build_image_prompt()
-                    vlm_res = self.vlm_client.generate(prompt, [img["bytes_b64"]])
-                except Exception as e:
-                    vlm_res = {"error": str(e)}
-            else:
-                vlm_res = {"error": "OpenAI client not configured"}
-            images_vlm_results.append({"slide": img.get("slide"), "vlm": vlm_res})
+        if image_jobs and self.vlm_manager:
+            responses = self.vlm_manager.run_requests([job["request"] for job in image_jobs])
+            for job, resp in zip(image_jobs, responses):
+                job["entry"]["vlm"] = resp
+                job["element"]["vlm"] = resp
+                images_vlm_results.append({"slide": job["slide"], "vlm": resp})
+        else:
+            for img in images_out:
+                vlm_res = img.get("vlm") or {"error": "OpenAI client not configured"}
+                images_vlm_results.append({"slide": img.get("slide"), "vlm": vlm_res})
+
+        if images_vlm_results:
+            images_vlm_results.sort(key=lambda item: item.get("slide", 0))
 
         return {
             "code": 0,
@@ -600,6 +827,7 @@ class DocumentProcessor:
             base_url=resolved_base_url,
             model=resolved_model,
         )
+        self.vlm_manager = VLMTaskManager(self.vlm_client)
 
         self.use_ocr = use_ocr
         self.ocr_lang = ocr_lang
@@ -615,19 +843,40 @@ class DocumentProcessor:
             return PDFParser(
                 use_ocr=self.use_ocr,
                 vlm_client=self.vlm_client,
+                vlm_manager=self.vlm_manager,
                 ocr_lang=self.ocr_lang,
                 camelot_enable=self.camelot_enable,
                 pdfplumber_enable=self.pdfplumber_enable,
                 parse_mode=self.pdf_parse_mode,
             )
         if any(lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"]):
-            return ImageParser(use_ocr=self.use_ocr, vlm_client=self.vlm_client, ocr_lang=self.ocr_lang)
+            return ImageParser(
+                use_ocr=self.use_ocr,
+                vlm_client=self.vlm_client,
+                vlm_manager=self.vlm_manager,
+                ocr_lang=self.ocr_lang,
+            )
         if lower.endswith(".docx") or lower.endswith(".doc"):
-            return DocxParser(use_ocr=self.use_ocr, vlm_client=self.vlm_client, ocr_lang=self.ocr_lang)
+            return DocxParser(
+                use_ocr=self.use_ocr,
+                vlm_client=self.vlm_client,
+                vlm_manager=self.vlm_manager,
+                ocr_lang=self.ocr_lang,
+            )
         if lower.endswith(".xlsx") or lower.endswith(".xls"):
-            return XlsxParser(use_ocr=self.use_ocr, vlm_client=self.vlm_client, ocr_lang=self.ocr_lang)
+            return XlsxParser(
+                use_ocr=self.use_ocr,
+                vlm_client=self.vlm_client,
+                vlm_manager=self.vlm_manager,
+                ocr_lang=self.ocr_lang,
+            )
         if lower.endswith(".pptx") or lower.endswith(".ppt"):
-            return PptxParser(use_ocr=self.use_ocr, vlm_client=self.vlm_client, ocr_lang=self.ocr_lang)
+            return PptxParser(
+                use_ocr=self.use_ocr,
+                vlm_client=self.vlm_client,
+                vlm_manager=self.vlm_manager,
+                ocr_lang=self.ocr_lang,
+            )
         raise ValueError("Unsupported file extension")
 
     def parse(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:

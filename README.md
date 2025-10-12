@@ -8,6 +8,7 @@ It can download remote files, run OCR/table extraction, optionally invoke a Visi
 - **Multi-format parsing** via PyMuPDF, pdfplumber, Camelot, python-docx, pandas/openpyxl, and python-pptx.
 - **OCR fallback** using Tesseract with configurable languages.
 - **Qwen3-VL-Plus integration** through the official `openai` Python SDK (OpenAI-compatible endpoint).
+- **Asynchronous VLM scheduling** with an internal task manager that caps concurrent multimodal calls at five to maximise throughput without overwhelming upstream services.
 - **Configurable PDF parsing modes** that let you choose between OCR-centric extraction or VLM-driven Markdown conversion.
 - **MCP tool** `parse_document_url` that accepts a single `options` dictionary while retaining the original flexibility.
 - **Health endpoint** for simple runtime checks when hosted through FastMCP.
@@ -23,6 +24,8 @@ The VLM client uses the official `openai` package to talk to Aliyun's OpenAI-com
    export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
    export QWEN_VLM_MODEL="qwen3-vl-plus"
    ```
+
+   The asynchronous VLM task manager automatically batches requests and respects a hard concurrency ceiling of five active calls, so no additional tuning is required.
 
 2. Call the MCP tool with the desired parsing mode:
 
@@ -45,6 +48,18 @@ The VLM client uses the official `openai` package to talk to Aliyun's OpenAI-com
    - Image parsing always leverages the VLM with prompts tuned to describe scenes, tables, and formulas (rendered as LaTeX).
 
 > **Note:** Outbound network access remains disabled in the evaluation environment; automated tests exercise the OpenAI code paths through stubs.
+
+## Output Layout Fidelity
+
+To help downstream consumers reconstruct documents faithfully, every parser now exposes an explicit ordering of textual, tabular, and visual content:
+
+- **PDF pages** include an `elements` array listing recognised text, OCR results, tables, embedded images, and VLM Markdown in reading order.
+- **DOCX files** add a `content.flow` array that interleaves paragraphs, tables, and extracted images with their corresponding indices and payloads.
+- **Images** expose a `content_flow` list that tracks the raw image, optional OCR output, and VLM transcription.
+- **PPTX slides** return an `elements` array per slide, preserving the sequence of text boxes, pictures, and speaker notes.
+- **PDF VLM mode** surfaces `document_elements` that pair the page image set with the aggregated Markdown response.
+
+These structures ensure each image, table, or text snippet can be reinserted at its original position when rendering the parsed output.
 
 ## Development Setup
 

@@ -179,6 +179,9 @@ def test_pdfparser_triggers_ocr_and_vlm(monkeypatch):
     assert res["vlm_pages"][0]["vlm"] == {"markdown": "page markdown"}
     assert called["images"] == [dpr._b64(b"PNG_BYTES")]
     assert "markdown" in called["prompt"].lower()
+    element_types = [el["type"] for el in res["pages"][0]["elements"]]
+    assert "ocr_text" in element_types
+    assert any(el.get("vlm", {}).get("markdown") == "page markdown" for el in res["pages"][0]["elements"] if el["type"] == "vlm_markdown")
 
 
 def test_pdfparser_vlm_mode_generates_markdown(monkeypatch):
@@ -212,6 +215,8 @@ def test_pdfparser_vlm_mode_generates_markdown(monkeypatch):
     assert res["vlm"] == {"markdown": "## Page 1\nConverted"}
     assert captured["images"] == ["IMG_B64"]
     assert "markdown" in captured["prompt"].lower()
+    assert res["pages"][0]["elements"][0]["type"] == "image"
+    assert res["document_elements"][0]["vlm"] == {"markdown": "## Page 1\nConverted"}
 
 
 def test_imageparser_ocr_and_vlm(monkeypatch):
@@ -238,6 +243,9 @@ def test_imageparser_ocr_and_vlm(monkeypatch):
     assert res["vlm"] == {"markdown": "image markdown"}
     assert called["images"] == [dpr._b64(image_bytes)]
     assert "tables" in called["prompt"].lower()
+    flow_types = [item["type"] for item in res["content_flow"]]
+    assert flow_types[0] == "image"
+    assert res["content_flow"][-1]["vlm"] == {"markdown": "image markdown"}
 
 def test_docxparser_parses_paragraphs_and_tables(monkeypatch):
     # fake Document object returning paragraphs and tables
@@ -262,6 +270,9 @@ def test_docxparser_parses_paragraphs_and_tables(monkeypatch):
     assert res["content"]["paragraphs"] == ["p1", "p2"]
     assert isinstance(res["content"]["tables"], list)
     assert res["content"]["tables"][0][0][0] == "r1c1"
+    flow_types = [item["type"] for item in res["content"]["flow"]]
+    assert flow_types.count("paragraph") >= 1
+    assert "table" in flow_types
 
 def test_xlsxparser_reads_sheets(monkeypatch):
     # fake DataFrame-like with shape and to_csv
