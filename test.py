@@ -14,11 +14,6 @@ async def main():
             "parse_document_url",
             {
                 "file_url": "http://localhost:5050/example_files/test_ocr.png",
-                "run_vlm": False,
-                "use_ocr": False,
-                "ocr_lang": "eng",
-                "camelot_enable": False,
-                "pdfplumber_enable": False,
             },
         )
 
@@ -29,7 +24,7 @@ async def main():
             print("Keys:", list(result.keys())[:10])
             print("Elapsed seconds:", result.get("elapsed_seconds"))
         else:
-            print(result.data)
+            print(result)
 
 if __name__ == "__main__":
     asyncio.run(main())
