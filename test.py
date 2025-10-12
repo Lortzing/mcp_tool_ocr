@@ -1,4 +1,5 @@
 import asyncio
+import json
 from fastmcp import Client
 
 async def main():
@@ -13,16 +14,33 @@ async def main():
         result = await client.call_tool(
             "parse_document_url",
             {
-                "file_url": "http://localhost:5050/example_files/test_ocr.png",
+                "file_url": "https://sample-files.com/downloads/documents/pdf/sample-report.pdf",
             },
         )
 
         print("\n--- Result ---")
+        payload = None
         if isinstance(result, dict):
-            # 打印主要字段
-            print("Type:", result.get("type"))
-            print("Keys:", list(result.keys())[:10])
-            print("Elapsed seconds:", result.get("elapsed_seconds"))
+            payload = result
+        elif hasattr(result, "content"):
+            for item in getattr(result, "content", []):
+                text_value = getattr(item, "text", None)
+                if isinstance(text_value, str) and text_value.strip():
+                    try:
+                        payload = json.loads(text_value)
+                    except json.JSONDecodeError:
+                        payload = text_value
+                    break
+
+        if isinstance(payload, dict):
+            print("Type:", payload.get("type"))
+            print("Keys:", list(payload.keys())[:10])
+            print("Elapsed seconds:", payload.get("elapsed_seconds"))
+            summary = payload.get("summary")
+            if isinstance(summary, str):
+                print("Summary snippet:", summary[:200])
+        elif isinstance(payload, str):
+            print(payload[:500])
         else:
             print(result)
 
