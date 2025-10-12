@@ -39,6 +39,13 @@ def _b64(bytestr: bytes) -> str:
     return base64.b64encode(bytestr).decode("utf-8")
 
 
+def _binary_placeholder(label: str) -> str:
+    """Generate a consistent placeholder for removed binary payloads."""
+
+    clean_label = label.strip() or "content"
+    return f"[binary content omitted: {clean_label}]"
+
+
 class VLMClient:
     """Minimal wrapper around the OpenAI client for multimodal interactions."""
 
@@ -329,13 +336,13 @@ class PDFParser(BaseParser):
             for img_ref in imgs:
                 try:
                     xref = img_ref[0]
-                    pix = fitz.Pixmap(doc, xref)
-                    if pix.n < 5:
-                        imgbytes = pix.tobytes("png")
-                    else:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                        imgbytes = pix.tobytes("png")
-                    images_out.append({"page": pno + 1, "bytes_b64": _b64(imgbytes)})
+                    fitz.Pixmap(doc, xref)  # ensure the reference is valid
+                    images_out.append(
+                        {
+                            "page": pno + 1,
+                            "description": _binary_placeholder("embedded image"),
+                        }
+                    )
                 except Exception:
                     continue
         return images_out
@@ -458,7 +465,10 @@ class PDFParser(BaseParser):
                     page_entry = result["pages"][index]
                     self._append_page_element(
                         page_entry,
-                        {"type": "image", "bytes_b64": img.get("bytes_b64")},
+                        {
+                            "type": "image",
+                            "description": _binary_placeholder("embedded image"),
+                        },
                     )
 
         if vlm_requests and self.vlm_manager:
@@ -489,7 +499,13 @@ class PDFParser(BaseParser):
         for idx in range(len(doc)):
             try:
                 png_bytes = self._render_page_to_png(doc[idx], zoom=2.0)
-                images.append({"page_number": idx + 1, "image_b64": _b64(png_bytes)})
+                images.append(
+                    {
+                        "page_number": idx + 1,
+                        "image_b64": _b64(png_bytes),
+                        "placeholder": _binary_placeholder(f"page {idx + 1} render"),
+                    }
+                )
             except Exception:
                 images.append({"page_number": idx + 1, "error": "render_failed"})
         return images
@@ -509,27 +525,37 @@ class PDFParser(BaseParser):
         )
 
     def _parse_with_vlm(self, doc, start: float) -> Dict[str, Any]:
-        page_images = self._render_document_to_images(doc)
-        images_payload = [item.get("image_b64") for item in page_images if "image_b64" in item]
+        page_images_raw = self._render_document_to_images(doc)
+        images_payload = [item.get("image_b64") for item in page_images_raw if item.get("image_b64")]
 
         if not images_payload:
             return {
                 "error": "pdf to image conversion failed",
-                "details": page_images,
+                "details": page_images_raw,
             }
 
         pages_metadata = []
-        for item in page_images:
-            entry = {"page_number": item.get("page_number"), "elements": []}
-            image_b64 = item.get("image_b64")
-            if image_b64:
-                self._append_page_element(entry, {"type": "image", "image_b64": image_b64})
+        page_images: List[Dict[str, Any]] = []
+        for item in page_images_raw:
+            page_number = item.get("page_number")
+            entry = {"page_number": page_number, "elements": []}
+            placeholder = item.get("placeholder")
+            if not placeholder and item.get("image_b64"):
+                placeholder = _binary_placeholder(f"page {page_number} render")
+            if placeholder:
+                self._append_page_element(
+                    entry,
+                    {"type": "image", "description": placeholder},
+                )
+                page_images.append({"page_number": page_number, "description": placeholder})
+            elif item.get("error"):
+                page_images.append({"page_number": page_number, "error": item.get("error")})
             pages_metadata.append(entry)
 
         if not self.vlm_manager:
             vlm_response = {"error": "OpenAI client not configured"}
         else:
-            prompt = self._build_pdf_document_prompt(page_images)
+            prompt = self._build_pdf_document_prompt(page_images_raw)
             vlm_response = self.vlm_manager.run_single(VLMRequest(prompt=prompt, images_b64=images_payload))
 
         document_elements = []
@@ -553,7 +579,11 @@ class ImageParser(BaseParser):
         start = time.time()
         result: Dict[str, Any] = {"code": 0, "type": "image", "vlm": None, "elapsed_seconds": None}
         img_b64 = _b64(data)
-        content_flow: List[Dict[str, Any]] = [{"type": "image", "order": 1, "image_b64": img_b64}]
+        placeholder = _binary_placeholder("original image")
+        content_flow: List[Dict[str, Any]] = [
+            {"type": "image", "order": 1, "description": placeholder}
+        ]
+        result["image"] = {"description": placeholder}
 
         if self.use_ocr:
             try:
@@ -653,14 +683,19 @@ class DocxParser(BaseParser):
                     if "image" in getattr(rel, "reltype", ""):
                         blob = rel.target_part.blob
                         image_b64 = _b64(blob)
-                        image_entry = {"bytes_b64": image_b64, "vlm": None}
+                        placeholder = _binary_placeholder("embedded image")
+                        image_entry = {
+                            "index": len(images),
+                            "description": placeholder,
+                            "vlm": None,
+                        }
                         images.append(image_entry)
                         flow.append(
                             {
                                 "type": "image",
-                                "index": len(images) - 1,
+                                "index": image_entry["index"],
                                 "order": len(flow) + 1,
-                                "bytes_b64": image_b64,
+                                "description": placeholder,
                             }
                         )
                         if self.vlm_manager:
@@ -743,12 +778,17 @@ class PptxParser(BaseParser):
                         if image is not None:
                             blob = image.blob
                             img_b64 = _b64(blob)
-                            image_entry = {"slide": i + 1, "bytes_b64": img_b64, "vlm": None}
+                            placeholder = _binary_placeholder("slide image")
+                            image_entry = {
+                                "slide": i + 1,
+                                "description": placeholder,
+                                "vlm": None,
+                            }
                             images_out.append(image_entry)
                             image_element = {
                                 "type": "image",
                                 "order": len(elements) + 1,
-                                "bytes_b64": img_b64,
+                                "description": placeholder,
                                 "image_index": len(images_out) - 1,
                             }
                             elements.append(image_element)
@@ -885,6 +925,357 @@ class DocumentProcessor:
 
 
 # -------------------------
+# Markdown formatting utilities
+# -------------------------
+
+def _format_vlm_markdown(vlm_payload: Any) -> str:
+    if isinstance(vlm_payload, dict):
+        markdown = vlm_payload.get("markdown")
+        if isinstance(markdown, str) and markdown.strip():
+            return markdown.strip()
+        error = vlm_payload.get("error")
+        if isinstance(error, str):
+            return f"Error: {error}"
+    if isinstance(vlm_payload, str) and vlm_payload.strip():
+        return vlm_payload.strip()
+    return ""
+
+
+def _format_ocr_blocks(ocr_payload: Any, limit: int = 8) -> List[str]:
+    if not isinstance(ocr_payload, dict):
+        return []
+    blocks = ocr_payload.get("blocks") or []
+    if not isinstance(blocks, list):
+        return []
+    lines: List[str] = []
+    lang = ocr_payload.get("lang")
+    if isinstance(lang, str) and lang:
+        lines.append(f"- OCR language: {lang}")
+    count = 0
+    for block in blocks:
+        if count >= limit:
+            break
+        text = ""
+        if isinstance(block, dict):
+            text = str(block.get("text", "")).strip()
+        elif isinstance(block, str):
+            text = block.strip()
+        if text:
+            lines.append(f"- {text}")
+            count += 1
+    total = len(blocks)
+    if total > count:
+        lines.append(f"- ... ({total} OCR segments in total)")
+    return lines
+
+
+def _format_table_rows(rows: Any) -> str:
+    if not isinstance(rows, list) or not rows:
+        return ""
+    max_cols = max((len(row) for row in rows if isinstance(row, list)), default=0)
+    if max_cols == 0:
+        return ""
+    header = rows[0] if isinstance(rows[0], list) else [rows[0]]
+    header = list(header) + [""] * (max_cols - len(header))
+    body_rows = []
+    for row in rows[1:]:
+        if isinstance(row, list):
+            padded = list(row) + [""] * (max_cols - len(row))
+            body_rows.append(padded)
+        else:
+            body_rows.append([str(row)] + [""] * (max_cols - 1))
+    divider = "|".join([" --- " for _ in range(max_cols)])
+    lines = [
+        "| " + " | ".join(str(cell).strip() for cell in header) + " |",
+        "|" + divider + "|",
+    ]
+    for row in body_rows:
+        lines.append("| " + " | ".join(str(cell).strip() for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def _format_pdf_markdown(parsed: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    mode = parsed.get("mode")
+    pages = parsed.get("pages") or []
+    lines.append("## PDF Overview")
+    if isinstance(mode, str):
+        lines.append(f"- Mode: {mode}")
+    lines.append(f"- Pages parsed: {len(pages)}")
+    lines.append("")
+
+    warnings = parsed.get("warnings") or []
+    if warnings:
+        lines.append("### Warnings")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    for page in pages:
+        page_number = page.get("page_number") if isinstance(page, dict) else None
+        if page_number is None:
+            continue
+        lines.append(f"### Page {page_number}")
+        text_content = ""
+        if isinstance(page, dict):
+            text_content = str(page.get("text", "")).strip()
+        if text_content:
+            lines.append("#### Extracted Text")
+            lines.append(text_content)
+            lines.append("")
+
+        ocr_lines = _format_ocr_blocks(page.get("ocr")) if isinstance(page, dict) else []
+        if ocr_lines:
+            lines.append("#### OCR Highlights")
+            lines.extend(ocr_lines)
+            lines.append("")
+
+        elements = page.get("elements") if isinstance(page, dict) else []
+        if elements:
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                etype = element.get("type")
+                if etype == "table":
+                    source = element.get("source", "table")
+                    lines.append(f"- Table ({source})")
+                    md_table = _format_table_rows(element.get("table"))
+                    if md_table:
+                        lines.append(md_table)
+                    lines.append("")
+                elif etype == "image":
+                    lines.append(f"- {element.get('description', _binary_placeholder('image'))}")
+                elif etype == "vlm_markdown":
+                    vlm_text = _format_vlm_markdown(element.get("vlm"))
+                    if vlm_text:
+                        lines.append("#### VLM Markdown")
+                        lines.append(vlm_text)
+                        lines.append("")
+        lines.append("")
+
+    tables_pdfplumber = parsed.get("tables_pdfplumber") or {}
+    if isinstance(tables_pdfplumber, dict) and tables_pdfplumber.get("pages"):
+        lines.append("### Tables (pdfplumber)")
+        for table_page in tables_pdfplumber.get("pages", []):
+            if not isinstance(table_page, dict):
+                continue
+            page_number = table_page.get("page_number")
+            tables = table_page.get("tables") or []
+            lines.append(f"- Page {page_number}: {len(tables)} table(s)")
+        lines.append("")
+
+    camelot_tables = parsed.get("tables_camelot") or {}
+    if isinstance(camelot_tables, dict) and camelot_tables.get("tables"):
+        lines.append("### Tables (camelot)")
+        tables = camelot_tables.get("tables", [])
+        lines.append(f"- Extracted tables: {len(tables)}")
+        lines.append("")
+
+    images = parsed.get("images") or []
+    if images:
+        lines.append("### Embedded Images")
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            page_number = image.get("page")
+            description = image.get("description", _binary_placeholder("embedded image"))
+            if page_number is not None:
+                lines.append(f"- Page {page_number}: {description}")
+        lines.append("")
+
+    vlm_pages = parsed.get("vlm_pages") or []
+    if vlm_pages:
+        lines.append("### VLM Page Summaries")
+        for entry in vlm_pages:
+            if not isinstance(entry, dict):
+                continue
+            page_number = entry.get("page_number")
+            vlm_text = _format_vlm_markdown(entry.get("vlm"))
+            if vlm_text:
+                lines.append(f"#### Page {page_number}")
+                lines.append(vlm_text)
+        lines.append("")
+
+    vlm_document = _format_vlm_markdown(parsed.get("vlm"))
+    if vlm_document:
+        lines.append("### Document-Level Markdown")
+        lines.append(vlm_document)
+        lines.append("")
+
+    return lines
+
+
+def _format_image_markdown(parsed: Dict[str, Any]) -> List[str]:
+    lines = ["## Image Overview"]
+    placeholder = parsed.get("image", {}).get("description")
+    if placeholder:
+        lines.append(f"- Image: {placeholder}")
+    lines.append("")
+    if parsed.get("ocr"):
+        ocr_lines = _format_ocr_blocks(parsed.get("ocr"))
+        if ocr_lines:
+            lines.append("### OCR Highlights")
+            lines.extend(ocr_lines)
+            lines.append("")
+    vlm_text = _format_vlm_markdown(parsed.get("vlm"))
+    if vlm_text:
+        lines.append("### VLM Markdown")
+        lines.append(vlm_text)
+        lines.append("")
+    return lines
+
+
+def _format_docx_markdown(parsed: Dict[str, Any]) -> List[str]:
+    lines = ["## DOCX Overview"]
+    content = parsed.get("content") or {}
+    paragraphs = content.get("paragraphs") if isinstance(content, dict) else []
+    if paragraphs:
+        lines.append("### Paragraphs")
+        for idx, para in enumerate(paragraphs, 1):
+            lines.append(f"{idx}. {para}")
+        lines.append("")
+    tables = content.get("tables") if isinstance(content, dict) else []
+    if tables:
+        lines.append("### Tables")
+        for idx, table in enumerate(tables, 1):
+            lines.append(f"#### Table {idx}")
+            md_table = _format_table_rows(table)
+            if md_table:
+                lines.append(md_table)
+            lines.append("")
+    images = parsed.get("images") or []
+    if images:
+        lines.append("### Embedded Images")
+        for idx, image in enumerate(images, 1):
+            description = image.get("description", _binary_placeholder("embedded image")) if isinstance(image, dict) else _binary_placeholder("embedded image")
+            lines.append(f"- Image {idx}: {description}")
+        lines.append("")
+    images_vlm = parsed.get("images_vlm") or []
+    if images_vlm:
+        lines.append("### Image VLM Summaries")
+        for entry in images_vlm:
+            if not isinstance(entry, dict):
+                continue
+            order = entry.get("order")
+            vlm_text = _format_vlm_markdown(entry.get("vlm"))
+            if vlm_text:
+                lines.append(f"- Flow position {order}: {vlm_text}")
+        lines.append("")
+    return lines
+
+
+def _format_xlsx_markdown(parsed: Dict[str, Any]) -> List[str]:
+    lines = ["## XLSX Overview"]
+    content = parsed.get("content") or {}
+    sheets = content.get("sheets") if isinstance(content, dict) else {}
+    if sheets:
+        for name, sheet in sheets.items():
+            lines.append(f"### Sheet: {name}")
+            if isinstance(sheet, dict):
+                shape = sheet.get("shape")
+                if shape:
+                    lines.append(f"- Shape: {shape}")
+                csv_text = sheet.get("csv")
+                if isinstance(csv_text, str) and csv_text.strip():
+                    lines.append("```csv")
+                    lines.append(csv_text.strip())
+                    lines.append("```")
+            lines.append("")
+    return lines
+
+
+def _format_pptx_markdown(parsed: Dict[str, Any]) -> List[str]:
+    lines = ["## PPTX Overview"]
+    slides = parsed.get("slides") or []
+    for slide in slides:
+        if not isinstance(slide, dict):
+            continue
+        slide_number = slide.get("slide_number")
+        lines.append(f"### Slide {slide_number}")
+        texts = slide.get("texts") or []
+        if texts:
+            lines.append("#### Text Content")
+            for idx, text in enumerate(texts, 1):
+                lines.append(f"{idx}. {text}")
+            lines.append("")
+        notes = slide.get("notes")
+        if notes:
+            lines.append("#### Speaker Notes")
+            lines.append(notes)
+            lines.append("")
+        elements = slide.get("elements") or []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            if element.get("type") == "image":
+                description = element.get("description", _binary_placeholder("slide image"))
+                lines.append(f"- {description}")
+            elif element.get("type") == "vlm_markdown":
+                vlm_text = _format_vlm_markdown(element.get("vlm"))
+                if vlm_text:
+                    lines.append("#### Image VLM Markdown")
+                    lines.append(vlm_text)
+                    lines.append("")
+            elif element.get("type") == "notes":
+                continue
+        lines.append("")
+    images_vlm = parsed.get("images_vlm") or []
+    if images_vlm:
+        lines.append("### Image VLM Summaries")
+        for entry in images_vlm:
+            if not isinstance(entry, dict):
+                continue
+            slide_number = entry.get("slide")
+            vlm_text = _format_vlm_markdown(entry.get("vlm"))
+            if vlm_text:
+                lines.append(f"- Slide {slide_number}: {vlm_text}")
+        lines.append("")
+    return lines
+
+
+def build_markdown_report(parsed: Any, filename: Optional[str] = None) -> str:
+    if isinstance(parsed, dict) and parsed.get("error"):
+        lines = ["# Document Parse Error"]
+        if filename:
+            lines.append(f"- **File:** {filename}")
+        lines.append(f"- **Error:** {parsed.get('error')}")
+        details = parsed.get("details") or parsed.get("trace")
+        if isinstance(details, str) and details.strip():
+            lines.append("")
+            lines.append("```")
+            lines.append(details.strip())
+            lines.append("```")
+        return "\n".join(lines)
+
+    if not isinstance(parsed, dict):
+        return str(parsed)
+
+    doc_type = str(parsed.get("type", "document")).upper()
+    title = filename or "document"
+    lines: List[str] = [f"# Parse Result for {title}", "", f"- **Type:** {doc_type}"]
+    elapsed = parsed.get("elapsed_seconds")
+    if isinstance(elapsed, (int, float)):
+        lines.append(f"- **Elapsed Seconds:** {elapsed:.2f}")
+    lines.append("")
+
+    type_dispatch = {
+        "PDF": _format_pdf_markdown,
+        "IMAGE": _format_image_markdown,
+        "DOCX": _format_docx_markdown,
+        "XLSX": _format_xlsx_markdown,
+        "PPTX": _format_pptx_markdown,
+    }
+    formatter = type_dispatch.get(doc_type)
+    if formatter:
+        lines.extend(formatter(parsed))
+    else:
+        lines.append("## Content")
+        lines.append(json.dumps(parsed, ensure_ascii=False, indent=2))
+
+    return "\n".join(line for line in lines if line is not None)
+
+
+# -------------------------
 # MCP wrapper
 # -------------------------
 
@@ -919,7 +1310,7 @@ if mcp:
 
         try:
             parsed = dp.parse(file_bytes, filename)
-            return json.dumps(parsed, ensure_ascii=False, indent=2)
+            return build_markdown_report(parsed, filename=filename)
         except ValueError as e:
             return {"error": str(e)}
         except Exception:

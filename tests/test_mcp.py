@@ -182,6 +182,7 @@ def test_pdfparser_triggers_ocr_and_vlm(monkeypatch):
     element_types = [el["type"] for el in res["pages"][0]["elements"]]
     assert "ocr_text" in element_types
     assert any(el.get("vlm", {}).get("markdown") == "page markdown" for el in res["pages"][0]["elements"] if el["type"] == "vlm_markdown")
+    assert all("image_b64" not in el for el in res["pages"][0]["elements"])
 
 
 def test_pdfparser_vlm_mode_generates_markdown(monkeypatch):
@@ -217,6 +218,7 @@ def test_pdfparser_vlm_mode_generates_markdown(monkeypatch):
     assert "markdown" in captured["prompt"].lower()
     assert res["pages"][0]["elements"][0]["type"] == "image"
     assert res["document_elements"][0]["vlm"] == {"markdown": "## Page 1\nConverted"}
+    assert "description" in res["page_images"][0]
 
 
 def test_imageparser_ocr_and_vlm(monkeypatch):
@@ -246,6 +248,8 @@ def test_imageparser_ocr_and_vlm(monkeypatch):
     flow_types = [item["type"] for item in res["content_flow"]]
     assert flow_types[0] == "image"
     assert res["content_flow"][-1]["vlm"] == {"markdown": "image markdown"}
+    assert res["image"]["description"].startswith("[binary content omitted")
+    assert "image_b64" not in str(res)
 
 def test_docxparser_parses_paragraphs_and_tables(monkeypatch):
     # fake Document object returning paragraphs and tables
@@ -273,6 +277,7 @@ def test_docxparser_parses_paragraphs_and_tables(monkeypatch):
     flow_types = [item["type"] for item in res["content"]["flow"]]
     assert flow_types.count("paragraph") >= 1
     assert "table" in flow_types
+    assert res["images"] == [] or "description" in res["images"][0]
 
 def test_xlsxparser_reads_sheets(monkeypatch):
     # fake DataFrame-like with shape and to_csv
@@ -288,6 +293,30 @@ def test_xlsxparser_reads_sheets(monkeypatch):
     assert res["type"] == "xlsx"
     assert "Sheet1" in res["content"]["sheets"]
     assert res["content"]["sheets"]["Sheet1"]["shape"] == (2, 1)
+
+
+def test_build_markdown_report_produces_plain_text():
+    parsed = {
+        "type": "pdf",
+        "mode": "ocr",
+        "elapsed_seconds": 0.5,
+        "pages": [
+            {
+                "page_number": 1,
+                "text": "Hello world",
+                "elements": [
+                    {"type": "image", "description": "[binary content omitted: embedded image]"},
+                    {"type": "vlm_markdown", "vlm": {"markdown": "**Summary**"}},
+                ],
+            }
+        ],
+        "images": [{"page": 1, "description": "[binary content omitted: embedded image]"}],
+    }
+    markdown = dpr.build_markdown_report(parsed, filename="sample.pdf")
+    assert markdown.startswith("# Parse Result for sample.pdf")
+    assert "embedded image" in markdown
+    assert "IMG_B64" not in markdown
+    assert "**Summary**" in markdown
 
 # ------------------------------------------------------------
 # run tests with: pytest -q
