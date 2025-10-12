@@ -111,33 +111,79 @@ class VLMClient:
                     content = message.get("content")
                     if isinstance(content, str):
                         texts.append(content)
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                text = item.get("text") or item.get("value")
+                                if isinstance(text, str):
+                                    texts.append(text)
                 elif hasattr(message, "content"):
                     content = getattr(message, "content")
                     if isinstance(content, str):
                         texts.append(content)
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                text = item.get("text") or item.get("value")
+                                if isinstance(text, str):
+                                    texts.append(text)
             if texts:
                 return "".join(texts)
         return ""
+
+    @staticmethod
+    def _responses_payload(prompt: str, images_b64: List[str]) -> List[Dict[str, Any]]:
+        content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        for img in images_b64:
+            content.append({"type": "input_image", "image": {"base64": img}})
+        return [{"role": "user", "content": content}]
+
+    @staticmethod
+    def _chat_messages(prompt: str, images_b64: List[str]) -> List[Dict[str, Any]]:
+        message_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for img in images_b64:
+            message_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img}"},
+                }
+            )
+        return [{"role": "user", "content": message_content}]
 
     def generate(self, prompt: str, images_b64: List[str]) -> Dict[str, Any]:
         if not self._ensure_client():
             return {"error": "OpenAI client not configured"}
 
-        content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
-        for img in images_b64:
-            content.append({"type": "input_image", "image": {"base64": img}})
+        responses_payload = self._responses_payload(prompt, images_b64)
 
         try:
             response = self._client.responses.create(
                 model=self.model,
-                input=[{"role": "user", "content": content}],
+                input=responses_payload,
             )
             return {
                 "markdown": self._extract_text(response),
                 "raw": self._safe_dump(response),
             }
-        except Exception as exc:
-            return {"error": f"OpenAI call failed: {exc}"}
+        except Exception as primary_exc:
+            try:
+                chat_response = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=self._chat_messages(prompt, images_b64),
+                )
+                return {
+                    "markdown": self._extract_text(chat_response),
+                    "raw": self._safe_dump(chat_response),
+                    "fallback": "chat.completions",
+                }
+            except Exception as fallback_exc:
+                return {
+                    "error": (
+                        "OpenAI call failed: "
+                        f"responses endpoint error: {primary_exc}; "
+                        f"chat completions fallback error: {fallback_exc}"
+                    )
+                }
 
 
 @dataclass
