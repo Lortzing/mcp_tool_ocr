@@ -73,6 +73,41 @@ Run unit tests with:
 pytest -q
 ```
 
+## Manual Testing with the Sample Report PDF
+
+The repository includes a small client script (`test.py`) that exercises the `parse_document_url` MCP tool end-to-end. To reproduce the flow with the hosted sample report:
+
+1. Start the MCP server in one terminal:
+
+   ```bash
+   uv run python main.py
+   ```
+
+2. In a second terminal, call the tool through the client:
+
+   ```bash
+   uv run python test.py
+   ```
+
+   The client is preconfigured to fetch `https://sample-files.com/downloads/documents/pdf/sample-report.pdf` and will print the structured response payload returned by the tool.
+
+Example output (truncated for brevity):
+
+```
+Type: pdf
+Keys: ['type', 'filename', 'elapsed_seconds', 'summary', 'markdown']
+Elapsed seconds: 1.74
+Summary snippet: # Parse Result for sample-report.pdf
+
+- **Type:** PDF
+- **Elapsed Seconds:** 1.75
+
+### Warnings
+- camelot failed: module 'camelot' has no attribute 'read_pdf'
+```
+
+The server log will emit warnings like `Cannot set gray stroke color because /'P6' is an invalid float value`; these originate from PyMuPDF while rendering embedded images and can be safely ignored during local testing.
+
 ## Repository Structure
 
 - `main.py` – core parsers, OCR helpers, VLM client, and MCP wiring.

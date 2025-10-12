@@ -1360,7 +1360,26 @@ if mcp:
 
         try:
             parsed = dp.parse(file_bytes, filename)
-            return build_markdown_report(parsed, filename=filename)
+            report = build_markdown_report(parsed, filename=filename)
+
+            if isinstance(parsed, dict):
+                elapsed = parsed.get("elapsed_seconds")
+                doc_type = parsed.get("type", "document")
+            else:
+                elapsed = None
+                doc_type = "document"
+
+            summary = report[:500]
+            if len(report) > 500:
+                summary = summary.rstrip() + "..."
+
+            return {
+                "type": doc_type,
+                "filename": filename,
+                "elapsed_seconds": elapsed,
+                "summary": summary,
+                "markdown": report,
+            }
         except ValueError as e:
             return {"error": str(e)}
         except Exception:
