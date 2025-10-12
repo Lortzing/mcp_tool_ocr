@@ -8,7 +8,7 @@ import json
 import base64
 import traceback
 import urllib.parse
-import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -147,37 +147,41 @@ class VLMRequest:
 
 
 class VLMTaskManager:
-    """Manage asynchronous VLM invocations with a concurrency ceiling."""
+    """Manage VLM invocations with a concurrency ceiling without requiring an event loop."""
 
     def __init__(self, client: Optional[VLMClient], max_concurrent: int = 5):
         self.client = client
         self.max_concurrent = max(1, min(max_concurrent, 5))
 
-    async def _run_all(self, requests: List[VLMRequest]) -> List[Dict[str, Any]]:
-        semaphore = asyncio.Semaphore(self.max_concurrent)
-
-        async def _task(request: VLMRequest) -> Dict[str, Any]:
-            if not self.client:
-                return {"error": "OpenAI client not configured"}
-            if not request.images_b64:
-                return {"error": "No images provided for VLM request"}
-            async with semaphore:
-                try:
-                    return await asyncio.to_thread(
-                        self.client.generate, request.prompt, request.images_b64
-                    )
-                except Exception as exc:
-                    return {"error": f"OpenAI call failed: {exc}"}
-
-        tasks = [_task(req) for req in requests]
-        return await asyncio.gather(*tasks)
+    def _execute_request(self, request: VLMRequest) -> Dict[str, Any]:
+        if not self.client:
+            return {"error": "OpenAI client not configured"}
+        if not request.images_b64:
+            return {"error": "No images provided for VLM request"}
+        try:
+            return self.client.generate(request.prompt, request.images_b64)
+        except Exception as exc:
+            return {"error": f"OpenAI call failed: {exc}"}
 
     def run_requests(self, requests: List[VLMRequest]) -> List[Dict[str, Any]]:
         if not requests:
             return []
         if not self.client:
             return [{"error": "OpenAI client not configured"} for _ in requests]
-        return asyncio.run(self._run_all(requests))
+
+        results: List[Dict[str, Any]] = [{} for _ in requests]
+        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+            future_map = {
+                executor.submit(self._execute_request, request): idx
+                for idx, request in enumerate(requests)
+            }
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    results[idx] = {"error": f"OpenAI call failed: {exc}"}
+        return results
 
     def run_single(self, request: VLMRequest) -> Dict[str, Any]:
         results = self.run_requests([request])
